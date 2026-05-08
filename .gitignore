@@ -1,0 +1,26 @@
+# Built binary
+/deskbell
+
+# Local tooling / build output
+/bin/
+/dist/
+/tmp/
+
+# Test / coverage artefacts
+*.test
+*.out
+coverage.*
+
+# Original source bundle
+*.zip
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Working notes — local-only, not for the public repo
+CLAUDE.md
+.claude/

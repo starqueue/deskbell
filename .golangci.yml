@@ -1,0 +1,56 @@
+version: "2"
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errcheck
+    - errorlint
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - intrange
+    - misspell
+    - nakedret
+    - prealloc
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - wastedassign
+    - whitespace
+  settings:
+    gocritic:
+      disabled-checks:
+        - exitAfterDefer
+    gosec:
+      excludes:
+        # journalctlCmd, whoCmd, useradd, usermod, systemctl etc. are
+        # package constants / install-path constants, not user input.
+        - G204
+        # math/rand/v2 for retry jitter is appropriate; not a security primitive.
+        - G404
+        # The ntfy URL is validated up front in readConfig and runInstall
+        # (scheme allowlist + topic regex); this is a documented false positive.
+        - G107
+        - G704
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
