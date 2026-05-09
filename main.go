@@ -21,6 +21,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -31,7 +32,9 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/netip"
+	"net/smtp"
 	"net/url"
 	"os"
 	"os/exec"
@@ -55,7 +58,7 @@ import (
 //
 // When unset, versionString() falls back to the module version (set by
 // `go install module@vX.Y.Z`) and finally to the embedded VCS revision.
-var version = "dev"
+var version = "v0.2.0"
 
 func versionString() string {
 	if version != "dev" {
@@ -104,6 +107,8 @@ const (
 	maxQueueSize         = 1000 // (N1) bound the rate-limited queue under sustained outages
 	flushTimeout         = 5 * time.Second
 	scannerBufferSize    = 1 << 20 // 1 MiB max token size for the journalctl stderr scanner
+	emailDialTimeout     = 15 * time.Second
+	emailIOTimeout       = 30 * time.Second
 )
 
 // -----------------------------------------------------------------------------
@@ -124,16 +129,65 @@ const (
 )
 
 type Config struct {
+	// NtfyURL/NtfyTopic/NtfyToken describe the *primary* ntfy destination
+	// configured via -ntfy-url / -topic / DESKBELL_NTFY_TOKEN. They are
+	// retained for backwards compatibility with existing call sites and
+	// tests; readConfig also folds them into NtfyDests as the first entry.
 	NtfyURL   string
 	NtfyTopic string
 	NtfyToken string // env-only; never a flag (would leak via /proc/*/cmdline)
-	Hostname  string
-	DryRun    bool
-	Verbose   bool
+
+	// NtfyDests is the full list of ntfy destinations the daemon will fan
+	// notifications out to. When empty, transport assembly falls back to
+	// the legacy primary fields above.
+	NtfyDests []NtfyDest
+
+	// Email is non-nil when SMTP is configured. Notifications are mirrored
+	// to email in addition to (not instead of) any ntfy destinations.
+	Email *EmailConfig
+
+	Hostname    string
+	DryRun      bool
+	Verbose     bool
+	StartupPing bool
 
 	// PollInterval drives both the file tail and the who(1) snapshot loop.
 	// Validated to [minPollInterval, maxPollInterval].
 	PollInterval time.Duration
+}
+
+// NtfyDest is one ntfy destination (server URL + topic + optional bearer
+// token). The daemon fans every notification out to every destination.
+type NtfyDest struct {
+	URL   string
+	Topic string
+	Token string // empty means no Authorization header on this destination
+}
+
+// EmailConfig is the SMTP configuration for the optional email transport.
+// All fields are sourced from environment variables only; nothing here is a
+// command-line flag (passwords would leak via /proc/<pid>/cmdline).
+type EmailConfig struct {
+	Host    string   // hostname only (port is separate)
+	Port    int      // 25, 465, 587, …
+	User    string   // SASL PLAIN username (may be empty for unauthenticated relays)
+	Pass    string   // SASL PLAIN password
+	From    string   // RFC 5322 sender; defaults to User if empty
+	To      []string // one or more RFC 5322 recipients
+	TLSMode string   // "auto" | "starttls" | "tls" | "none"
+}
+
+// destinations returns the effective fan-out list, falling back to the
+// legacy single-destination fields when NtfyDests is empty so direct
+// Config{NtfyURL: …, NtfyTopic: …} construction still works in tests.
+func (c Config) destinations() []NtfyDest {
+	if len(c.NtfyDests) > 0 {
+		return c.NtfyDests
+	}
+	if c.NtfyTopic == "" {
+		return nil
+	}
+	return []NtfyDest{{URL: c.NtfyURL, Topic: c.NtfyTopic, Token: c.NtfyToken}}
 }
 
 // (RateLimited helper removed: rate-limiting is always on with the
@@ -147,33 +201,21 @@ func readConfig(args []string, getenv func(string) string) (Config, error) {
 	cfg := Config{Hostname: hn}
 
 	fs := flag.NewFlagSet("deskbell", flag.ContinueOnError)
-	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: deskbell [flags]\n\n")
-		fmt.Fprintf(fs.Output(), "Watches login events on this host and posts notifications to ntfy.\n\n")
-		fmt.Fprintf(fs.Output(), "Subcommands:\n")
-		fmt.Fprintf(fs.Output(), "  install      install as a systemd service (root)\n")
-		fmt.Fprintf(fs.Output(), "  uninstall    remove the systemd service (root)\n")
-		fmt.Fprintf(fs.Output(), "  version      print version and exit\n")
-		fmt.Fprintf(fs.Output(), "  help         print this help\n\n")
-		fmt.Fprintf(fs.Output(), "Environment:\n")
-		fmt.Fprintf(fs.Output(), "  DESKBELL_NTFY_URL    overrides -ntfy-url\n")
-		fmt.Fprintf(fs.Output(), "  DESKBELL_NTFY_TOPIC  overrides -topic\n")
-		fmt.Fprintf(fs.Output(), "  DESKBELL_NTFY_TOKEN  bearer token (env-only; never a flag)\n\n")
-		fmt.Fprintf(fs.Output(), "Flags:\n")
-		fs.PrintDefaults()
-	}
+	fs.Usage = func() { printDaemonUsage(fs) }
 	fs.StringVar(&cfg.NtfyURL, "ntfy-url",
 		cmp.Or(strings.TrimSpace(getenv("DESKBELL_NTFY_URL")), "https://ntfy.sh"),
-		"ntfy server URL")
+		"primary ntfy server URL")
 	fs.StringVar(&cfg.NtfyTopic, "topic",
 		strings.TrimSpace(getenv("DESKBELL_NTFY_TOPIC")),
-		"ntfy topic (required)")
+		"primary ntfy topic")
 	fs.DurationVar(&cfg.PollInterval, "poll", defaultPollInterval,
 		"poll interval for log files and who(1); 1s–60s")
 	fs.BoolVar(&cfg.DryRun, "dry-run", false,
 		"print notifications instead of sending them")
 	fs.BoolVar(&cfg.Verbose, "verbose", false,
 		"verbose logging")
+	fs.BoolVar(&cfg.StartupPing, "startup-ping", parseBoolEnv(getenv("DESKBELL_STARTUP_PING"), true),
+		"send a 'deskbell started' notification at startup (env: DESKBELL_STARTUP_PING)")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -181,39 +223,239 @@ func readConfig(args []string, getenv func(string) string) (Config, error) {
 
 	// Token from env only, never a flag. (B15.)
 	cfg.NtfyToken = strings.TrimSpace(getenv("DESKBELL_NTFY_TOKEN"))
-
 	cfg.NtfyURL = strings.TrimRight(strings.TrimSpace(cfg.NtfyURL), "/")
 	cfg.NtfyTopic = strings.Trim(strings.TrimSpace(cfg.NtfyTopic), "/")
 
-	if cfg.NtfyURL == "" {
-		return cfg, errors.New("ntfy URL is required (-ntfy-url or DESKBELL_NTFY_URL)")
+	// Assemble the ntfy fan-out list: the legacy primary destination first
+	// (if -topic / DESKBELL_NTFY_TOPIC is set), then any extras from
+	// DESKBELL_NTFY_DESTINATIONS.
+	var dests []NtfyDest
+	if cfg.NtfyTopic != "" {
+		d := NtfyDest{URL: cfg.NtfyURL, Topic: cfg.NtfyTopic, Token: cfg.NtfyToken}
+		if err := validateNtfyDest(d); err != nil {
+			return cfg, fmt.Errorf("primary ntfy destination: %w", err)
+		}
+		dests = append(dests, d)
 	}
-	if cfg.NtfyTopic == "" {
-		return cfg, errors.New("ntfy topic is required (-topic or DESKBELL_NTFY_TOPIC)")
+	if extra := strings.TrimSpace(getenv("DESKBELL_NTFY_DESTINATIONS")); extra != "" {
+		parsed, err := parseNtfyDestinations(extra)
+		if err != nil {
+			return cfg, fmt.Errorf("DESKBELL_NTFY_DESTINATIONS: %w", err)
+		}
+		dests = append(dests, parsed...)
 	}
-	// (N13) ntfy topic names must be URL-safe. Reject anything that would
-	// distort the request URL (slashes, query/fragment, whitespace, etc.)
-	// rather than concatenating it blindly.
-	if !ntfyTopicRE.MatchString(cfg.NtfyTopic) {
-		return cfg, fmt.Errorf("ntfy topic must match [A-Za-z0-9_-]{1,64}, got %q", cfg.NtfyTopic)
+	cfg.NtfyDests = dests
+
+	// Email is opt-in: configured only when DESKBELL_SMTP_HOST is set.
+	if strings.TrimSpace(getenv("DESKBELL_SMTP_HOST")) != "" {
+		ec, err := parseEmailConfig(getenv)
+		if err != nil {
+			return cfg, fmt.Errorf("SMTP config: %w", err)
+		}
+		cfg.Email = ec
 	}
-	// (#3) Validate the URL and refuse to send a bearer token over plain
-	// HTTP. Localhost is exempt so self-hosted dev setups still work.
-	u, err := url.Parse(cfg.NtfyURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return cfg, fmt.Errorf("invalid ntfy URL: %q", cfg.NtfyURL)
+
+	if len(cfg.NtfyDests) == 0 && cfg.Email == nil {
+		return cfg, errors.New("no transports configured: set -topic / DESKBELL_NTFY_TOPIC, DESKBELL_NTFY_DESTINATIONS, or the DESKBELL_SMTP_* env vars")
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return cfg, fmt.Errorf("ntfy URL scheme must be http or https, got %q", u.Scheme)
-	}
-	if cfg.NtfyToken != "" && u.Scheme != "https" && !isLoopbackHost(u.Hostname()) {
-		return cfg, errors.New("DESKBELL_NTFY_TOKEN refuses to be sent over plain HTTP; use https or set the URL to a localhost target")
-	}
+
 	if cfg.PollInterval < minPollInterval || cfg.PollInterval > maxPollInterval {
 		return cfg, fmt.Errorf("-poll must be between %s and %s, got %s",
 			minPollInterval, maxPollInterval, cfg.PollInterval)
 	}
 	return cfg, nil
+}
+
+// printDaemonUsage prints the top-level help, including all configuration
+// environment variables. Kept as a free function so subcommands can call it.
+func printDaemonUsage(fs *flag.FlagSet) {
+	w := fs.Output()
+	fmt.Fprintf(w, "Usage: deskbell [flags]\n\n")
+	fmt.Fprintf(w, "Watches login events on this host and posts notifications to ntfy and/or\n")
+	fmt.Fprintf(w, "email. Multiple ntfy destinations are supported; if both ntfy and email are\n")
+	fmt.Fprintf(w, "configured, every notification is sent to both.\n\n")
+	fmt.Fprintf(w, "Subcommands:\n")
+	fmt.Fprintf(w, "  install      install as a systemd service (root)\n")
+	fmt.Fprintf(w, "  uninstall    remove the systemd service (root)\n")
+	fmt.Fprintf(w, "  check        send a test notification to every configured transport\n")
+	fmt.Fprintf(w, "  version      print version and exit\n")
+	fmt.Fprintf(w, "  help         print this help\n\n")
+	fmt.Fprintf(w, "Flags:\n")
+	fs.PrintDefaults()
+	fmt.Fprintf(w, "\nntfy environment variables:\n")
+	fmt.Fprintf(w, "  DESKBELL_NTFY_URL           primary server URL (default https://ntfy.sh)\n")
+	fmt.Fprintf(w, "  DESKBELL_NTFY_TOPIC         primary topic, [A-Za-z0-9_-]{1,64}\n")
+	fmt.Fprintf(w, "  DESKBELL_NTFY_TOKEN         bearer token for the primary destination\n")
+	fmt.Fprintf(w, "  DESKBELL_NTFY_DESTINATIONS  extra destinations, comma-separated entries of\n")
+	fmt.Fprintf(w, "                              the form url|topic[|token]. Example:\n")
+	fmt.Fprintf(w, "                              https://ntfy.sh|alerts,https://ntfy.example.com|host-events|tk_xxx\n")
+	fmt.Fprintf(w, "\nemail (SMTP) environment variables — all optional, but DESKBELL_SMTP_HOST and\n")
+	fmt.Fprintf(w, "DESKBELL_SMTP_TO are required to enable the email transport:\n")
+	fmt.Fprintf(w, "  DESKBELL_SMTP_HOST          SMTP server hostname (e.g. smtp.gmail.com)\n")
+	fmt.Fprintf(w, "  DESKBELL_SMTP_PORT          SMTP server port (default 587)\n")
+	fmt.Fprintf(w, "  DESKBELL_SMTP_USER          SASL PLAIN username (optional)\n")
+	fmt.Fprintf(w, "  DESKBELL_SMTP_PASS          SASL PLAIN password (env-only; never a flag)\n")
+	fmt.Fprintf(w, "  DESKBELL_SMTP_FROM          From: address (defaults to DESKBELL_SMTP_USER)\n")
+	fmt.Fprintf(w, "  DESKBELL_SMTP_TO            comma-separated To: list (required)\n")
+	fmt.Fprintf(w, "  DESKBELL_SMTP_TLS           auto | starttls | tls | none (default auto:\n")
+	fmt.Fprintf(w, "                              implicit TLS on port 465, STARTTLS otherwise)\n")
+	fmt.Fprintf(w, "\nOther environment variables:\n")
+	fmt.Fprintf(w, "  DESKBELL_STARTUP_PING       false to skip the startup notification\n")
+}
+
+// parseBoolEnv parses an env-style bool (1/0/true/false/yes/no, case-insensitive).
+// Returns def when the input is empty.
+func parseBoolEnv(s string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return def
+	case "1", "t", "true", "y", "yes", "on":
+		return true
+	case "0", "f", "false", "n", "no", "off":
+		return false
+	}
+	return def
+}
+
+// validateNtfyDest checks a single destination's URL, topic, and
+// token-over-plain-HTTP rule.
+func validateNtfyDest(d NtfyDest) error {
+	if d.URL == "" {
+		return errors.New("URL is empty")
+	}
+	if d.Topic == "" {
+		return errors.New("topic is empty")
+	}
+	if !ntfyTopicRE.MatchString(d.Topic) {
+		return fmt.Errorf("topic must match [A-Za-z0-9_-]{1,64}, got %q", d.Topic)
+	}
+	u, err := url.Parse(d.URL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("invalid URL: %q", d.URL)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be http or https, got %q", u.Scheme)
+	}
+	if d.Token != "" && u.Scheme != "https" && !isLoopbackHost(u.Hostname()) {
+		return fmt.Errorf("token refuses to be sent over plain HTTP to %s; use https or a loopback URL", u.Host)
+	}
+	return nil
+}
+
+// parseNtfyDestinations parses the DESKBELL_NTFY_DESTINATIONS value: a
+// comma-separated list of entries of the form url|topic[|token].
+func parseNtfyDestinations(s string) ([]NtfyDest, error) {
+	var out []NtfyDest
+	for _, raw := range strings.Split(s, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		parts := strings.Split(entry, "|")
+		if len(parts) < 2 || len(parts) > 3 {
+			return nil, fmt.Errorf("entry %q must be url|topic[|token]", entry)
+		}
+		d := NtfyDest{
+			URL:   strings.TrimRight(strings.TrimSpace(parts[0]), "/"),
+			Topic: strings.Trim(strings.TrimSpace(parts[1]), "/"),
+		}
+		if len(parts) == 3 {
+			d.Token = strings.TrimSpace(parts[2])
+		}
+		if err := validateNtfyDest(d); err != nil {
+			return nil, fmt.Errorf("entry %q: %w", entry, err)
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// parseEmailConfig builds an EmailConfig from DESKBELL_SMTP_* env vars.
+// The caller has already verified DESKBELL_SMTP_HOST is non-empty.
+func parseEmailConfig(getenv func(string) string) (*EmailConfig, error) {
+	host := strings.TrimSpace(getenv("DESKBELL_SMTP_HOST"))
+	port := 587
+	// Allow either DESKBELL_SMTP_PORT or "host:port" in DESKBELL_SMTP_HOST.
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		host = h
+		if n, err := strconv.Atoi(p); err == nil && n > 0 {
+			port = n
+		}
+	}
+	if v := strings.TrimSpace(getenv("DESKBELL_SMTP_PORT")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 || n > 65535 {
+			return nil, fmt.Errorf("DESKBELL_SMTP_PORT must be 1-65535, got %q", v)
+		}
+		port = n
+	}
+	if host == "" {
+		return nil, errors.New("DESKBELL_SMTP_HOST is empty after parsing")
+	}
+
+	to := splitAndTrim(getenv("DESKBELL_SMTP_TO"), ",")
+	if len(to) == 0 {
+		return nil, errors.New("DESKBELL_SMTP_TO is required (comma-separated recipients)")
+	}
+	for _, addr := range to {
+		if _, err := mail.ParseAddress(addr); err != nil {
+			return nil, fmt.Errorf("DESKBELL_SMTP_TO: invalid address %q: %w", addr, err)
+		}
+	}
+
+	user := strings.TrimSpace(getenv("DESKBELL_SMTP_USER"))
+	pass := getenv("DESKBELL_SMTP_PASS") // intentionally not Trim'd: passwords may contain edge whitespace? trim leading/trailing only.
+	pass = strings.Trim(pass, " \t\r\n")
+	if user != "" && pass == "" {
+		return nil, errors.New("DESKBELL_SMTP_USER set but DESKBELL_SMTP_PASS is empty")
+	}
+
+	from := strings.TrimSpace(getenv("DESKBELL_SMTP_FROM"))
+	if from == "" {
+		from = user
+	}
+	if from == "" {
+		return nil, errors.New("DESKBELL_SMTP_FROM is required when DESKBELL_SMTP_USER is empty")
+	}
+	if _, err := mail.ParseAddress(from); err != nil {
+		return nil, fmt.Errorf("DESKBELL_SMTP_FROM: invalid address %q: %w", from, err)
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(getenv("DESKBELL_SMTP_TLS")))
+	switch mode {
+	case "":
+		mode = "auto"
+	case "auto", "starttls", "tls", "none":
+	default:
+		return nil, fmt.Errorf("DESKBELL_SMTP_TLS must be one of auto|starttls|tls|none, got %q", mode)
+	}
+	if mode == "none" && !isLoopbackHost(host) {
+		return nil, fmt.Errorf("DESKBELL_SMTP_TLS=none refused for non-loopback host %q (would leak credentials)", host)
+	}
+
+	return &EmailConfig{
+		Host:    host,
+		Port:    port,
+		User:    user,
+		Pass:    pass,
+		From:    from,
+		To:      to,
+		TLSMode: mode,
+	}, nil
+}
+
+// splitAndTrim splits on sep and trims whitespace from each piece, dropping
+// empty pieces.
+func splitAndTrim(s, sep string) []string {
+	parts := strings.Split(s, sep)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // isLoopbackHost reports whether host is a literal loopback address or
@@ -1061,25 +1303,74 @@ func loginDedupKey(ev LoginEvent) string {
 // or hung ntfy server can't block the scheduler from draining n.in. (#4)
 // -----------------------------------------------------------------------------
 
+// Notification is a transport-agnostic message. Priority and Tags are ntfy
+// concepts; the email transport ignores them.
+type Notification struct {
+	Title    string
+	Body     string
+	Priority string
+	Tags     string
+}
+
+// Transport sends a single Notification to one destination. Implementations
+// must be safe for concurrent calls (the Notifier fans out in parallel).
+type Transport interface {
+	Name() string
+	Send(ctx context.Context, n Notification) error
+}
+
+// permanentError marks a transport error that should not be retried, e.g.
+// auth failures. sendWithRetry checks for this via errors.As.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
 type Notifier struct {
-	cfg     Config
-	logger  *slog.Logger
-	http    *http.Client
-	in      chan LoginEvent
-	requeue chan LoginEvent // (#4) failed sends come back here
-	done    chan struct{}
-	sendWg  sync.WaitGroup // tracks in-flight HTTP sends
+	cfg        Config
+	logger     *slog.Logger
+	transports []Transport
+	in         chan LoginEvent
+	requeue    chan LoginEvent // (#4) failed sends come back here
+	done       chan struct{}
+	sendWg     sync.WaitGroup // tracks in-flight sends
 }
 
 func newNotifier(cfg Config, logger *slog.Logger) *Notifier {
 	return &Notifier{
-		cfg:     cfg,
-		logger:  logger,
-		http:    &http.Client{Timeout: notifyHTTPTimeout},
-		in:      make(chan LoginEvent, notifierQueueSize),
-		requeue: make(chan LoginEvent, notifierQueueSize),
-		done:    make(chan struct{}),
+		cfg:        cfg,
+		logger:     logger,
+		transports: buildTransports(cfg),
+		in:         make(chan LoginEvent, notifierQueueSize),
+		requeue:    make(chan LoginEvent, notifierQueueSize),
+		done:       make(chan struct{}),
 	}
+}
+
+// buildTransports materialises the transport fan-out list from cfg. The
+// returned slice may be empty in DryRun mode or when only legacy fields are
+// set with no topic.
+func buildTransports(cfg Config) []Transport {
+	httpClient := &http.Client{Timeout: notifyHTTPTimeout}
+	var out []Transport
+	for i, d := range cfg.destinations() {
+		host := d.URL
+		if u, err := url.Parse(d.URL); err == nil && u.Host != "" {
+			host = u.Host
+		}
+		out = append(out, &ntfyTransport{
+			dest:   d,
+			client: httpClient,
+			name:   fmt.Sprintf("ntfy[%d:%s/%s]", i, host, d.Topic),
+		})
+	}
+	if cfg.Email != nil {
+		out = append(out, &emailTransport{
+			cfg:  *cfg.Email,
+			name: fmt.Sprintf("email[%s]", strings.Join(cfg.Email.To, ",")),
+		})
+	}
+	return out
 }
 
 // Submit hands an event to the notifier, dropping it on context cancel
@@ -1245,9 +1536,13 @@ func (n *Notifier) flushFinal(queue []LoginEvent) {
 }
 
 func (n *Notifier) sendOne(ctx context.Context, ev LoginEvent) error {
-	title := fmt.Sprintf("Login on %s: %s via %s", n.cfg.Hostname, ev.User, ev.Method)
-	body := formatBody(n.cfg, ev)
-	if err := n.publishWithRetry(ctx, title, body, "high", tagsForLogin(ev)); err != nil {
+	msg := Notification{
+		Title:    fmt.Sprintf("Login on %s: %s via %s", n.cfg.Hostname, ev.User, ev.Method),
+		Body:     formatBody(n.cfg, ev),
+		Priority: "high",
+		Tags:     tagsForLogin(ev),
+	}
+	if err := n.dispatch(ctx, msg); err != nil {
 		return err
 	}
 	n.logger.Info("notified login", "user", ev.User, "ip", ev.IP, "method", ev.Method, "source", ev.Source)
@@ -1293,7 +1588,13 @@ func (n *Notifier) sendDigest(ctx context.Context, queue []LoginEvent) error {
 		b.WriteString(row)
 		b.WriteByte('\n')
 	}
-	if err := n.publishWithRetry(ctx, title, b.String(), "default", "warning,bell"); err != nil {
+	msg := Notification{
+		Title:    title,
+		Body:     b.String(),
+		Priority: "default",
+		Tags:     "warning,bell",
+	}
+	if err := n.dispatch(ctx, msg); err != nil {
 		return err
 	}
 	n.logger.Info("notified digest", "events", len(queue))
@@ -1345,28 +1646,69 @@ func formatOrigin(ev LoginEvent) string {
 	}
 }
 
-// publishWithRetry sends a notification, retrying on transient failures
-// with bounded jittered exponential backoff. (B5.)
-func (n *Notifier) publishWithRetry(ctx context.Context, title, body, priority, tags string) error {
+// dispatch fans the message out to every transport in parallel. Returns nil
+// if at least one transport succeeded; returns the aggregated error if all
+// failed. Per-transport retry happens inside sendWithRetry. (B5.)
+func (n *Notifier) dispatch(ctx context.Context, msg Notification) error {
+	if n.cfg.DryRun {
+		fmt.Printf("DRY RUN notification\nTitle: %s\nPriority: %s\nTags: %s\n\n%s\n",
+			msg.Title, msg.Priority, msg.Tags, msg.Body)
+		return nil
+	}
+	if len(n.transports) == 0 {
+		return errors.New("no transports configured")
+	}
+	type result struct {
+		name string
+		err  error
+	}
+	results := make(chan result, len(n.transports))
+	for _, t := range n.transports {
+		go func(t Transport) {
+			results <- result{name: t.Name(), err: sendWithRetry(ctx, t, msg)}
+		}(t)
+	}
+	var sent int
+	var firstErr error
+	for range n.transports {
+		r := <-results
+		if r.err == nil {
+			sent++
+			continue
+		}
+		n.logger.Warn("transport failed", "transport", r.name, "err", r.err)
+		if firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", r.name, r.err)
+		}
+	}
+	if sent == 0 {
+		return fmt.Errorf("all %d transports failed; first error: %w", len(n.transports), firstErr)
+	}
+	return nil
+}
+
+// sendWithRetry retries Send on transient failures with jittered exponential
+// backoff. Permanent errors (auth failures, malformed STARTTLS, etc.) and
+// context errors short-circuit the retry loop.
+func sendWithRetry(ctx context.Context, t Transport, msg Notification) error {
 	backoff := notifyInitialBackoff
 	var lastErr error
 	for attempt := 1; attempt <= notifyMaxAttempts; attempt++ {
-		err := n.publish(ctx, title, body, priority, tags)
+		err := t.Send(ctx, msg)
 		if err == nil {
 			return nil
 		}
 		lastErr = err
-		// Don't retry context errors or auth-class failures.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
-		if isAuthFailure(err) {
+		var pe *permanentError
+		if errors.As(err, &pe) {
 			return err
 		}
 		if attempt == notifyMaxAttempts {
 			break
 		}
-		// Non-cryptographic randomness is appropriate for retry jitter.
 		jitter := time.Duration(rand.Int64N(int64(backoff / 2))) //nolint:gosec // G404
 		select {
 		case <-ctx.Done():
@@ -1383,45 +1725,152 @@ func (n *Notifier) publishWithRetry(ctx context.Context, title, body, priority, 
 	return fmt.Errorf("after %d attempts: %w", notifyMaxAttempts, lastErr)
 }
 
-type httpStatusError struct{ code int }
+// --- ntfy transport ---------------------------------------------------------
 
-func (e *httpStatusError) Error() string { return fmt.Sprintf("ntfy returned HTTP %d", e.code) }
-
-func isAuthFailure(err error) bool {
-	var hse *httpStatusError
-	if errors.As(err, &hse) {
-		return hse.code == http.StatusUnauthorized || hse.code == http.StatusForbidden
-	}
-	return false
+type ntfyTransport struct {
+	dest   NtfyDest
+	client *http.Client
+	name   string
 }
 
-func (n *Notifier) publish(ctx context.Context, title, body, priority, tags string) error {
-	if n.cfg.DryRun {
-		fmt.Printf("DRY RUN ntfy notification\nTitle: %s\nPriority: %s\nTags: %s\n\n%s\n", title, priority, tags, body)
-		return nil
-	}
-	url := n.cfg.NtfyURL + "/" + n.cfg.NtfyTopic
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(body))
+func (t *ntfyTransport) Name() string { return t.name }
+
+func (t *ntfyTransport) Send(ctx context.Context, n Notification) error {
+	endpoint := t.dest.URL + "/" + t.dest.Topic
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(n.Body))
 	if err != nil {
 		return fmt.Errorf("create ntfy request: %w", err)
 	}
-	req.Header.Set("Title", title)
-	req.Header.Set("Priority", priority)
-	req.Header.Set("Tags", tags)
-	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	if n.cfg.NtfyToken != "" {
-		req.Header.Set("Authorization", "Bearer "+n.cfg.NtfyToken)
+	req.Header.Set("Title", n.Title)
+	if n.Priority != "" {
+		req.Header.Set("Priority", n.Priority)
 	}
-	resp, err := n.http.Do(req)
+	if n.Tags != "" {
+		req.Header.Set("Tags", n.Tags)
+	}
+	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	if t.dest.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+t.dest.Token)
+	}
+	resp, err := t.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("send ntfy request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return &httpStatusError{code: resp.StatusCode}
+		hse := &httpStatusError{code: resp.StatusCode}
+		// 4xx (other than 408 / 429) won't fix itself on retry; tag as
+		// permanent so the retry loop skips the wait.
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 &&
+			resp.StatusCode != http.StatusRequestTimeout &&
+			resp.StatusCode != http.StatusTooManyRequests {
+			return &permanentError{err: hse}
+		}
+		return hse
 	}
 	return nil
+}
+
+type httpStatusError struct{ code int }
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("ntfy returned HTTP %d", e.code) }
+
+// --- email transport --------------------------------------------------------
+
+type emailTransport struct {
+	cfg  EmailConfig
+	name string
+}
+
+func (t *emailTransport) Name() string { return t.name }
+
+func (t *emailTransport) Send(ctx context.Context, n Notification) error {
+	addr := net.JoinHostPort(t.cfg.Host, strconv.Itoa(t.cfg.Port))
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(emailDialTimeout + emailIOTimeout)
+	}
+	dialer := &net.Dialer{Timeout: emailDialTimeout, Deadline: deadline}
+	tlsCfg := &tls.Config{ServerName: t.cfg.Host, MinVersion: tls.VersionTLS12}
+
+	useImplicitTLS := t.cfg.TLSMode == "tls" ||
+		(t.cfg.TLSMode == "auto" && t.cfg.Port == 465)
+
+	var conn net.Conn
+	var err error
+	if useImplicitTLS {
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	}
+	if err != nil {
+		return fmt.Errorf("dial smtp %s: %w", addr, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(deadline)
+
+	c, err := smtp.NewClient(conn, t.cfg.Host)
+	if err != nil {
+		return fmt.Errorf("smtp client: %w", err)
+	}
+	defer func() { _ = c.Quit() }()
+
+	if !useImplicitTLS && t.cfg.TLSMode != "none" {
+		if hasStartTLS, _ := c.Extension("STARTTLS"); hasStartTLS {
+			if err := c.StartTLS(tlsCfg); err != nil {
+				return fmt.Errorf("starttls: %w", err)
+			}
+		} else if t.cfg.TLSMode == "starttls" {
+			return &permanentError{err: errors.New("server does not advertise STARTTLS")}
+		}
+	}
+
+	if t.cfg.User != "" {
+		auth := smtp.PlainAuth("", t.cfg.User, t.cfg.Pass, t.cfg.Host)
+		if err := c.Auth(auth); err != nil {
+			return &permanentError{err: fmt.Errorf("smtp auth: %w", err)}
+		}
+	}
+
+	if err := c.Mail(t.cfg.From); err != nil {
+		return fmt.Errorf("smtp mail from: %w", err)
+	}
+	for _, rcpt := range t.cfg.To {
+		if err := c.Rcpt(rcpt); err != nil {
+			return fmt.Errorf("smtp rcpt to %s: %w", rcpt, err)
+		}
+	}
+	w, err := c.Data()
+	if err != nil {
+		return fmt.Errorf("smtp data: %w", err)
+	}
+	if _, err := w.Write([]byte(buildEmailMessage(t.cfg, n))); err != nil {
+		_ = w.Close()
+		return fmt.Errorf("smtp write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("smtp close: %w", err)
+	}
+	return nil
+}
+
+// buildEmailMessage assembles a minimal RFC 5322 message. Header values are
+// scrubbed of CR/LF to prevent header-injection from the title.
+func buildEmailMessage(cfg EmailConfig, n Notification) string {
+	subject := strings.ReplaceAll(strings.ReplaceAll(n.Title, "\r", " "), "\n", " ")
+	var b strings.Builder
+	fmt.Fprintf(&b, "From: %s\r\n", cfg.From)
+	fmt.Fprintf(&b, "To: %s\r\n", strings.Join(cfg.To, ", "))
+	fmt.Fprintf(&b, "Subject: %s\r\n", subject)
+	fmt.Fprintf(&b, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
+	fmt.Fprintf(&b, "MIME-Version: 1.0\r\n")
+	fmt.Fprintf(&b, "Content-Type: text/plain; charset=utf-8\r\n")
+	fmt.Fprintf(&b, "\r\n")
+	body := strings.ReplaceAll(n.Body, "\r\n", "\n")
+	body = strings.ReplaceAll(body, "\n", "\r\n")
+	b.WriteString(body)
+	return b.String()
 }
 
 // -----------------------------------------------------------------------------
@@ -1493,18 +1942,29 @@ func runInstall(args []string, getenv func(string) string) error {
 		binPath, unitPath, envPath     string
 		force                          bool
 	)
-	fs.StringVar(&topic, "topic", strings.TrimSpace(getenv("DESKBELL_NTFY_TOPIC")), "ntfy topic (required; env: DESKBELL_NTFY_TOPIC)")
-	fs.StringVar(&ntfyURL, "ntfy-url", cmp.Or(strings.TrimSpace(getenv("DESKBELL_NTFY_URL")), "https://ntfy.sh"), "ntfy server URL (env: DESKBELL_NTFY_URL)")
-	fs.StringVar(&token, "token", strings.TrimSpace(getenv("DESKBELL_NTFY_TOKEN")), "ntfy bearer token (env: DESKBELL_NTFY_TOKEN)")
+	fs.StringVar(&topic, "topic", strings.TrimSpace(getenv("DESKBELL_NTFY_TOPIC")), "primary ntfy topic (env: DESKBELL_NTFY_TOPIC)")
+	fs.StringVar(&ntfyURL, "ntfy-url", cmp.Or(strings.TrimSpace(getenv("DESKBELL_NTFY_URL")), "https://ntfy.sh"), "primary ntfy server URL (env: DESKBELL_NTFY_URL)")
+	fs.StringVar(&token, "token", strings.TrimSpace(getenv("DESKBELL_NTFY_TOKEN")), "primary ntfy bearer token (env: DESKBELL_NTFY_TOKEN)")
 	fs.StringVar(&svcUser, "user", defaultSvcUser, "system user to run the service as (created if missing)")
 	fs.StringVar(&binPath, "bin", defaultBinPath, "where to place the binary")
 	fs.StringVar(&unitPath, "unit", defaultUnitPath, "where to write the systemd unit")
 	fs.StringVar(&envPath, "env", defaultEnvPath, "where to write the environment file")
 	fs.BoolVar(&force, "force", false, "overwrite existing env file if present")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: deskbell install [flags]\n\n")
-		fmt.Fprintf(fs.Output(), "Installs deskbell as a hardened systemd service. Requires root.\n\n")
-		fmt.Fprintf(fs.Output(), "Flags:\n")
+		w := fs.Output()
+		fmt.Fprintf(w, "Usage: deskbell install [flags]\n\n")
+		fmt.Fprintf(w, "Installs deskbell as a hardened systemd service. Requires root.\n\n")
+		fmt.Fprintf(w, "The env file at -env is populated from the flags below plus any DESKBELL_*\n")
+		fmt.Fprintf(w, "variables present in the calling process. Either set them in the parent\n")
+		fmt.Fprintf(w, "shell and run with `sudo -E`, or pass -force to rewrite an existing file.\n")
+		fmt.Fprintf(w, "Configuration variables consumed by install (see `deskbell help` for full\n")
+		fmt.Fprintf(w, "documentation):\n")
+		fmt.Fprintf(w, "  DESKBELL_NTFY_URL DESKBELL_NTFY_TOPIC DESKBELL_NTFY_TOKEN\n")
+		fmt.Fprintf(w, "  DESKBELL_NTFY_DESTINATIONS\n")
+		fmt.Fprintf(w, "  DESKBELL_SMTP_HOST DESKBELL_SMTP_PORT DESKBELL_SMTP_USER DESKBELL_SMTP_PASS\n")
+		fmt.Fprintf(w, "  DESKBELL_SMTP_FROM DESKBELL_SMTP_TO DESKBELL_SMTP_TLS\n")
+		fmt.Fprintf(w, "  DESKBELL_STARTUP_PING\n\n")
+		fmt.Fprintf(w, "Flags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -1512,23 +1972,19 @@ func runInstall(args []string, getenv func(string) string) error {
 	}
 
 	if os.Geteuid() != 0 {
-		return errors.New("must be run as root (try: sudo deskbell install ...)")
+		return errors.New("must be run as root (try: sudo -E deskbell install ...)")
 	}
 	if !isSystemd() {
 		return errors.New("systemd not detected (no /run/systemd/system); for OpenRC/runit/s6 hosts, run deskbell directly under your supervisor of choice")
 	}
-	if topic == "" {
-		return errors.New("-topic is required (or set DESKBELL_NTFY_TOPIC)")
-	}
-	if !ntfyTopicRE.MatchString(topic) {
-		return fmt.Errorf("ntfy topic must match [A-Za-z0-9_-]{1,64}, got %q", topic)
-	}
-	u, err := url.Parse(ntfyURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return fmt.Errorf("invalid ntfy URL: %q", ntfyURL)
-	}
-	if token != "" && u.Scheme != "https" && !isLoopbackHost(u.Hostname()) {
-		return errors.New("refusing to write a bearer token destined for plain HTTP; use https or a loopback URL")
+
+	// Build the env-file contents from flags + forwarded DESKBELL_* env vars.
+	// Validate by feeding the same map back through readConfig so the daemon
+	// won't fail on first start because of a typo here.
+	envVars := collectInstallEnv(getenv, ntfyURL, topic, token)
+	mapEnv := func(k string) string { return envVars[k] }
+	if _, err := readConfig(nil, mapEnv); err != nil {
+		return fmt.Errorf("config validation: %w", err)
 	}
 
 	// 1. Place the binary at binPath. If we're already running from there,
@@ -1571,23 +2027,15 @@ func runInstall(args []string, getenv func(string) string) error {
 	if _, err := os.Stat(envPath); err == nil && !force {
 		fmt.Printf("install: env file %s already exists; leaving it alone (-force to overwrite)\n", envPath)
 	} else {
-		var b strings.Builder
-		fmt.Fprintf(&b, "DESKBELL_NTFY_URL=%s\n", strings.TrimRight(ntfyURL, "/"))
-		fmt.Fprintf(&b, "DESKBELL_NTFY_TOPIC=%s\n", topic)
-		if token != "" {
-			fmt.Fprintf(&b, "DESKBELL_NTFY_TOKEN=%s\n", token)
-		}
-		if err := writeFileAtomic(envPath, []byte(b.String()), 0o640); err != nil {
+		if err := writeFileAtomic(envPath, []byte(formatEnvFile(envVars)), 0o640); err != nil {
 			return fmt.Errorf("write env file: %w", err)
 		}
 		if u, err := user.Lookup(svcUser); err == nil {
-			uid, _ := strconv.Atoi(u.Uid)
 			gid, _ := strconv.Atoi(u.Gid)
 			_ = os.Chown(envPath, 0, gid)
 			_ = os.Chown(filepath.Dir(envPath), 0, gid)
-			_ = uid // silence unused if Chown fails
 		}
-		fmt.Printf("install: wrote %s\n", envPath)
+		fmt.Printf("install: wrote %s (%d variables)\n", envPath, len(envVars))
 	}
 
 	// 4. Render and write the unit file.
@@ -1668,6 +2116,164 @@ func runUninstall(args []string) error {
 		}
 	}
 	return nil
+}
+
+// installEnvVars lists every DESKBELL_* variable the install command writes
+// to the environment file (in the order they're emitted).
+var installEnvVars = []string{
+	"DESKBELL_NTFY_URL",
+	"DESKBELL_NTFY_TOPIC",
+	"DESKBELL_NTFY_TOKEN",
+	"DESKBELL_NTFY_DESTINATIONS",
+	"DESKBELL_SMTP_HOST",
+	"DESKBELL_SMTP_PORT",
+	"DESKBELL_SMTP_USER",
+	"DESKBELL_SMTP_PASS",
+	"DESKBELL_SMTP_FROM",
+	"DESKBELL_SMTP_TO",
+	"DESKBELL_SMTP_TLS",
+	"DESKBELL_STARTUP_PING",
+}
+
+// collectInstallEnv builds the DESKBELL_* map for the env file. Flag values
+// (-ntfy-url / -topic / -token) take precedence over their env counterparts;
+// every other DESKBELL_* variable is forwarded from the calling process.
+func collectInstallEnv(getenv func(string) string, ntfyURL, topic, token string) map[string]string {
+	out := make(map[string]string, len(installEnvVars))
+	for _, k := range installEnvVars {
+		if v := strings.TrimSpace(getenv(k)); v != "" {
+			out[k] = v
+		}
+	}
+	if v := strings.TrimRight(strings.TrimSpace(ntfyURL), "/"); v != "" {
+		out["DESKBELL_NTFY_URL"] = v
+	}
+	if v := strings.Trim(strings.TrimSpace(topic), "/"); v != "" {
+		out["DESKBELL_NTFY_TOPIC"] = v
+	}
+	if v := strings.TrimSpace(token); v != "" {
+		out["DESKBELL_NTFY_TOKEN"] = v
+	}
+	return out
+}
+
+// formatEnvFile renders a deskbell.env in EnvironmentFile= syntax. Values
+// that contain whitespace, '#', or '$' are double-quoted; embedded backslash
+// and double-quote are escaped.
+func formatEnvFile(env map[string]string) string {
+	var b strings.Builder
+	b.WriteString("# /etc/deskbell/deskbell.env — managed by `deskbell install`.\n")
+	b.WriteString("# Edit and `systemctl restart deskbell` to apply.\n\n")
+	for _, k := range installEnvVars {
+		v, ok := env[k]
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(&b, "%s=%s\n", k, quoteEnvValue(v))
+	}
+	return b.String()
+}
+
+func quoteEnvValue(v string) string {
+	needsQuote := false
+	for _, r := range v {
+		if r == ' ' || r == '\t' || r == '#' || r == '$' || r == '"' || r == '\\' || r == '\n' {
+			needsQuote = true
+			break
+		}
+	}
+	if !needsQuote {
+		return v
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range v {
+		switch r {
+		case '\\', '"':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case '\n':
+			b.WriteString("\\n")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// runCheck sends a test notification to every configured transport and
+// reports per-transport success/failure. Exits non-zero if any transport
+// fails so the command is useful in scripts and health probes.
+func runCheck(args []string, getenv func(string) string) error {
+	// Intercept -h / --help / help so users still get a check-specific banner;
+	// otherwise pass everything straight through to readConfig so `check`
+	// accepts the same flags as the daemon (-topic, -ntfy-url, -dry-run, …).
+	for _, a := range args {
+		switch a {
+		case "-h", "-help", "--help", "help":
+			fmt.Println("Usage: deskbell check [flags]")
+			fmt.Println()
+			fmt.Println("Sends a test notification to every configured transport and reports the")
+			fmt.Println("result. Accepts the same flags and DESKBELL_* environment variables as the")
+			fmt.Println("daemon — see `deskbell help` for the full list.")
+			return nil
+		}
+	}
+	cfg, err := readConfig(args, getenv)
+	if err != nil {
+		return err
+	}
+	// `check` exists precisely to verify real delivery — DryRun would make
+	// success vacuous, so override it here.
+	cfg.DryRun = false
+	transports := buildTransports(cfg)
+	if len(transports) == 0 {
+		return errors.New("no transports configured")
+	}
+	msg := Notification{
+		Title:    "deskbell check on " + cfg.Hostname,
+		Body:     fmt.Sprintf("Test notification from deskbell %s on %s at %s.\n\nIf you can read this, your configuration works.", versionString(), cfg.Hostname, time.Now().Format(time.RFC1123)),
+		Priority: "default",
+		Tags:     "white_check_mark",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var failed int
+	for _, t := range transports {
+		fmt.Printf("check: %-40s ... ", t.Name())
+		if err := sendWithRetry(ctx, t, msg); err != nil {
+			fmt.Printf("FAIL: %v\n", err)
+			failed++
+			continue
+		}
+		fmt.Println("OK")
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d/%d transports failed", failed, len(transports))
+	}
+	fmt.Printf("check: all %d transports OK\n", len(transports))
+	return nil
+}
+
+// sendStartupPing posts a low-priority "deskbell started" notification to
+// every configured transport. Best-effort; failures are logged but don't
+// abort the daemon.
+func sendStartupPing(ctx context.Context, n *Notifier, sources []string) {
+	if !n.cfg.StartupPing {
+		return
+	}
+	msg := Notification{
+		Title:    "deskbell started on " + n.cfg.Hostname,
+		Body:     fmt.Sprintf("deskbell %s now monitoring login events on %s.\nSources: %s\nStarted: %s", versionString(), n.cfg.Hostname, strings.Join(sources, ", "), time.Now().Format(time.RFC1123)),
+		Priority: "low",
+		Tags:     "bell",
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := n.dispatch(pingCtx, msg); err != nil {
+		n.logger.Warn("startup ping failed", "err", err)
+	}
 }
 
 // installBinary copies src to dst atomically with mode 0755.
@@ -1810,6 +2416,15 @@ func realMain() int {
 				return 1
 			}
 			return 0
+		case "check":
+			if err := runCheck(args[1:], os.Getenv); err != nil {
+				if errors.Is(err, flag.ErrHelp) {
+					return 0
+				}
+				fmt.Fprintln(os.Stderr, "check:", err)
+				return 1
+			}
+			return 0
 		case "version", "-version", "--version":
 			fmt.Println("deskbell", versionString())
 			return 0
@@ -1872,6 +2487,7 @@ func run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	// cancellation.
 	notifierCtx, notifierCancel := context.WithCancel(context.Background())
 	notifier := newNotifier(cfg, logger.With("component", "notifier"))
+	sendStartupPing(notifierCtx, notifier, names)
 	go func() {
 		// (N17) Recover so a panic in the notifier doesn't take the daemon
 		// down. notifier.Run's own `defer close(n.done)` fires before this

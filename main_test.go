@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -282,11 +284,12 @@ func TestReadConfig_PollIntervalRange(t *testing.T) {
 	}
 }
 
-// Topic is required: missing topic must be a hard error.
-func TestReadConfig_TopicRequired(t *testing.T) {
+// At least one transport must be configured: missing topic AND no SMTP must
+// be a hard error.
+func TestReadConfig_TransportRequired(t *testing.T) {
 	_, err := readConfig([]string{}, func(string) string { return "" })
-	if err == nil || !strings.Contains(err.Error(), "topic is required") {
-		t.Fatalf("expected topic-required error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "no transports configured") {
+		t.Fatalf("expected no-transports error, got %v", err)
 	}
 }
 
@@ -658,3 +661,242 @@ func TestFormatOrigin_IPv6Brackets(t *testing.T) {
 // (#10) main package imports utf8 — sanity that this test file compiles
 // against the same import.
 var _ = utf8.RuneStart
+
+// --- Multi-destination parsing ----------------------------------------------
+
+func TestParseNtfyDestinations_TwoEntries(t *testing.T) {
+	got, err := parseNtfyDestinations("https://ntfy.sh|alerts, https://ntfy.example.com|host-events|tk_xxx")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 dests, got %d", len(got))
+	}
+	if got[0].URL != "https://ntfy.sh" || got[0].Topic != "alerts" || got[0].Token != "" {
+		t.Errorf("dest[0] = %+v", got[0])
+	}
+	if got[1].URL != "https://ntfy.example.com" || got[1].Topic != "host-events" || got[1].Token != "tk_xxx" {
+		t.Errorf("dest[1] = %+v", got[1])
+	}
+}
+
+func TestParseNtfyDestinations_RejectsMalformed(t *testing.T) {
+	cases := []string{
+		"justone",                      // no pipe
+		"https://x.com|topic|tk|extra", // four fields
+		"|missingurl",
+		"https://x.com|",                              // empty topic
+		"http://example.com|topic|tk_x",               // token over plain HTTP
+		"https://x.com|" + strings.Repeat("a", 65),    // topic too long
+		"https://x.com|bad/topic",                     // bad chars
+	}
+	for _, c := range cases {
+		if _, err := parseNtfyDestinations(c); err == nil {
+			t.Errorf("expected error for %q, got nil", c)
+		}
+	}
+}
+
+func TestReadConfig_DestinationsAppendToPrimary(t *testing.T) {
+	env := map[string]string{
+		"DESKBELL_NTFY_TOPIC":        "primary",
+		"DESKBELL_NTFY_DESTINATIONS": "https://ntfy.example.com|extra",
+	}
+	cfg, err := readConfig(nil, func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("readConfig: %v", err)
+	}
+	if len(cfg.NtfyDests) != 2 {
+		t.Fatalf("expected 2 dests, got %d", len(cfg.NtfyDests))
+	}
+	if cfg.NtfyDests[0].Topic != "primary" || cfg.NtfyDests[1].Topic != "extra" {
+		t.Errorf("dests = %+v", cfg.NtfyDests)
+	}
+}
+
+// --- Email config parsing ---------------------------------------------------
+
+func TestParseEmailConfig_Minimal(t *testing.T) {
+	env := map[string]string{
+		"DESKBELL_SMTP_HOST": "smtp.example.com:587",
+		"DESKBELL_SMTP_USER": "alice@example.com",
+		"DESKBELL_SMTP_PASS": "hunter2",
+		"DESKBELL_SMTP_TO":   "ops@example.com, oncall@example.com",
+	}
+	ec, err := parseEmailConfig(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("parseEmailConfig: %v", err)
+	}
+	if ec.Host != "smtp.example.com" || ec.Port != 587 {
+		t.Errorf("host/port = %s/%d", ec.Host, ec.Port)
+	}
+	if ec.From != "alice@example.com" {
+		t.Errorf("From should default to User: got %q", ec.From)
+	}
+	if len(ec.To) != 2 {
+		t.Errorf("To = %v", ec.To)
+	}
+	if ec.TLSMode != "auto" {
+		t.Errorf("TLSMode default = %q, want auto", ec.TLSMode)
+	}
+}
+
+func TestParseEmailConfig_RejectsMisconfigurations(t *testing.T) {
+	cases := []map[string]string{
+		// no recipients
+		{"DESKBELL_SMTP_HOST": "smtp.example.com", "DESKBELL_SMTP_FROM": "from@x"},
+		// USER without PASS
+		{"DESKBELL_SMTP_HOST": "smtp.example.com", "DESKBELL_SMTP_USER": "u", "DESKBELL_SMTP_TO": "t@x", "DESKBELL_SMTP_FROM": "f@x"},
+		// invalid To
+		{"DESKBELL_SMTP_HOST": "smtp.example.com", "DESKBELL_SMTP_TO": "not-an-address", "DESKBELL_SMTP_FROM": "f@x"},
+		// invalid TLS mode
+		{"DESKBELL_SMTP_HOST": "smtp.example.com", "DESKBELL_SMTP_TO": "t@x", "DESKBELL_SMTP_FROM": "f@x", "DESKBELL_SMTP_TLS": "bogus"},
+		// TLS=none on non-loopback
+		{"DESKBELL_SMTP_HOST": "smtp.example.com", "DESKBELL_SMTP_TO": "t@x", "DESKBELL_SMTP_FROM": "f@x", "DESKBELL_SMTP_TLS": "none"},
+		// invalid port
+		{"DESKBELL_SMTP_HOST": "smtp.example.com", "DESKBELL_SMTP_PORT": "abc", "DESKBELL_SMTP_TO": "t@x", "DESKBELL_SMTP_FROM": "f@x"},
+	}
+	for i, env := range cases {
+		if _, err := parseEmailConfig(func(k string) string { return env[k] }); err == nil {
+			t.Errorf("case %d %v: expected error, got nil", i, env)
+		}
+	}
+}
+
+func TestReadConfig_EmailOnlyAccepted(t *testing.T) {
+	env := map[string]string{
+		"DESKBELL_SMTP_HOST": "smtp.example.com",
+		"DESKBELL_SMTP_FROM": "from@example.com",
+		"DESKBELL_SMTP_TO":   "to@example.com",
+	}
+	cfg, err := readConfig(nil, func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("readConfig: %v", err)
+	}
+	if len(cfg.NtfyDests) != 0 {
+		t.Errorf("expected 0 ntfy dests, got %d", len(cfg.NtfyDests))
+	}
+	if cfg.Email == nil {
+		t.Fatal("expected Email config to be set")
+	}
+}
+
+// --- Email message construction --------------------------------------------
+
+func TestBuildEmailMessage_HeaderInjectionScrubbed(t *testing.T) {
+	cfg := EmailConfig{From: "from@x", To: []string{"to@x"}}
+	n := Notification{Title: "evil\r\nBcc: attacker@x", Body: "hello"}
+	out := buildEmailMessage(cfg, n)
+	// Split headers from body. A successful injection would put "Bcc:" on
+	// its own line in the header block.
+	headerEnd := strings.Index(out, "\r\n\r\n")
+	if headerEnd < 0 {
+		t.Fatalf("missing header/body separator:\n%s", out)
+	}
+	headers := out[:headerEnd]
+	for _, line := range strings.Split(headers, "\r\n") {
+		if strings.HasPrefix(line, "Bcc:") {
+			t.Errorf("header injection not scrubbed:\n%s", out)
+		}
+	}
+	if !strings.Contains(out, "Subject: evil") {
+		t.Errorf("subject missing:\n%s", out)
+	}
+}
+
+// --- Env file rendering -----------------------------------------------------
+
+func TestQuoteEnvValue(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"plain", "plain"},
+		{"has space", `"has space"`},
+		{`has"quote`, `"has\"quote"`},
+		{`has\backslash`, `"has\\backslash"`},
+		{"with#hash", `"with#hash"`},
+		{"with$var", `"with$var"`},
+	}
+	for _, c := range cases {
+		if got := quoteEnvValue(c.in); got != c.want {
+			t.Errorf("quoteEnvValue(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestFormatEnvFile_PreservesOrder(t *testing.T) {
+	env := map[string]string{
+		"DESKBELL_NTFY_TOPIC":     "alerts",
+		"DESKBELL_NTFY_TOKEN":     "tk_xxx",
+		"DESKBELL_NTFY_URL":       "https://ntfy.sh",
+		"DESKBELL_SMTP_HOST":      "smtp.example.com",
+		"DESKBELL_NOT_RECOGNISED": "should-not-appear",
+	}
+	out := formatEnvFile(env)
+	urlIdx := strings.Index(out, "DESKBELL_NTFY_URL=")
+	topicIdx := strings.Index(out, "DESKBELL_NTFY_TOPIC=")
+	tokenIdx := strings.Index(out, "DESKBELL_NTFY_TOKEN=")
+	if urlIdx < 0 || topicIdx < 0 || tokenIdx < 0 {
+		t.Fatalf("missing keys in output:\n%s", out)
+	}
+	if urlIdx >= topicIdx || topicIdx >= tokenIdx {
+		t.Errorf("order: URL=%d TOPIC=%d TOKEN=%d", urlIdx, topicIdx, tokenIdx)
+	}
+	if strings.Contains(out, "DESKBELL_NOT_RECOGNISED") {
+		t.Errorf("unrecognised key leaked:\n%s", out)
+	}
+}
+
+// --- ntfy transport with a fake server -------------------------------------
+
+func TestNtfyTransport_RespectsHeadersAndAuth(t *testing.T) {
+	var (
+		seenAuth, seenTitle, seenPrio, seenTags, seenBody string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		seenTitle = r.Header.Get("Title")
+		seenPrio = r.Header.Get("Priority")
+		seenTags = r.Header.Get("Tags")
+		body, _ := io.ReadAll(r.Body)
+		seenBody = string(body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	tr := &ntfyTransport{
+		dest:   NtfyDest{URL: srv.URL, Topic: "t", Token: "tk_xxx"},
+		client: srv.Client(),
+		name:   "test",
+	}
+	err := tr.Send(context.Background(), Notification{
+		Title: "T", Body: "B", Priority: "high", Tags: "bell",
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if seenAuth != "Bearer tk_xxx" {
+		t.Errorf("auth header = %q", seenAuth)
+	}
+	if seenTitle != "T" || seenBody != "B" || seenPrio != "high" || seenTags != "bell" {
+		t.Errorf("unexpected request: title=%q body=%q prio=%q tags=%q",
+			seenTitle, seenBody, seenPrio, seenTags)
+	}
+}
+
+func TestNtfyTransport_4xxIsPermanent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(401)
+	}))
+	defer srv.Close()
+	tr := &ntfyTransport{
+		dest:   NtfyDest{URL: srv.URL, Topic: "t"},
+		client: srv.Client(),
+		name:   "test",
+	}
+	err := tr.Send(context.Background(), Notification{Title: "T", Body: "B"})
+	var pe *permanentError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected permanentError, got %T: %v", err, err)
+	}
+}
