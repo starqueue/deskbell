@@ -10,8 +10,10 @@ deskbell runs on a Linux machine and sends you a notification when someone
 signs in. It detects SSH, console, display-manager (GDM, LightDM, SDDM,
 XDM, KDM, greetd), and Cockpit logins, and fans every notification out to
 any number of [ntfy](https://ntfy.sh) destinations (public ntfy.sh,
-self-hosted, or a mix) and/or email — in parallel, with retries. Single Go
-binary, self-installing hardened systemd service, no broker, no agent.
+self-hosted, or a mix) and/or email — in parallel, with retries.
+
+deskbell is a single binary file approx 6–7 MB in size. Self-installing
+hardened systemd service.
 
 ---
 
@@ -25,7 +27,7 @@ binary, self-installing hardened systemd service, no broker, no agent.
     - [iOS — important: make notifications persistent](#ios--important-make-notifications-persistent)
     - [Android — usually works out of the box](#android--usually-works-out-of-the-box)
 - [Install](#install)
-  - [Get the binary](#get-the-binary)
+  - [Get the deskbell binary](#get-the-deskbell-binary)
   - [systemd (self-install)](#systemd-self-install)
   - [OpenRC](#openrc)
   - [runit](#runit)
@@ -367,7 +369,7 @@ your init / process supervisor**. Skip to your supervisor:
 | **supervisord** | Distro-agnostic Python supervisor | [supervisord](#supervisord) |
 | **none** | Testing, containers, foreground in tmux/screen | [Run it directly](#run-it-directly-no-supervisor) |
 
-### Get the binary
+### Get the deskbell binary
 
 #### Option A: prebuilt release (recommended)
 
