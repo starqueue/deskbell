@@ -314,16 +314,38 @@ func TestFormatBody_IncludesEveryField(t *testing.T) {
 // loginDedupKey
 // -----------------------------------------------------------------------------
 
-// loginDedupKey currently includes Port. SSH source ports are ephemeral,
-// so two reconnects from the same client within the dedup window produce
-// different keys and therefore separate notifications. This documents that
-// behaviour rather than the more intuitive "Port should not affect the
-// key" — see the README for the rule of thumb.
-func TestLoginDedupKey_PortIsPartOfKey(t *testing.T) {
+// Port is part of the dedup key by design. Each distinct SSH connection
+// uses its own ephemeral source port, so two reconnects from the same
+// client get separate notifications — which is the intended behaviour.
+// The deduper is only there to suppress the *same* single login event
+// being reported by two sources (journald + who(1)) within the 60 s
+// window, not to collapse genuinely distinct sign-ins.
+func TestLoginDedupKey_PortDistinguishesSessions(t *testing.T) {
 	a := LoginEvent{User: "alice", IP: "1.2.3.4", Method: "publickey", Port: "22"}
 	b := LoginEvent{User: "alice", IP: "1.2.3.4", Method: "publickey", Port: "23"}
 	if loginDedupKey(a) == loginDedupKey(b) {
 		t.Errorf("expected different ports to produce different keys")
+	}
+}
+
+// Same single login surfacing in journal AND who(1) within the 60 s
+// window must collapse to one notification — that's what the deduper is
+// for. Same User+IP+Port+TTY+Method = same key.
+func TestLoginDedupKey_SameEventInTwoSourcesCollapses(t *testing.T) {
+	fromJournal := LoginEvent{User: "alice", IP: "1.2.3.4", Method: "publickey", Port: "22", Source: "journal"}
+	fromWho := LoginEvent{User: "alice", IP: "1.2.3.4", Method: "publickey", Port: "22", Source: "who"}
+	if loginDedupKey(fromJournal) != loginDedupKey(fromWho) {
+		t.Error("the same login event reported by two sources must produce the same key")
+	}
+}
+
+// Different machines must always fire separately, regardless of how
+// quickly the second login follows.
+func TestLoginDedupKey_DifferentIPDifferentKey(t *testing.T) {
+	a := LoginEvent{User: "alice", IP: "1.2.3.4", Method: "publickey", Port: "22"}
+	b := LoginEvent{User: "alice", IP: "10.0.0.5", Method: "publickey", Port: "22"}
+	if loginDedupKey(a) == loginDedupKey(b) {
+		t.Errorf("expected different IPs to produce different keys")
 	}
 }
 

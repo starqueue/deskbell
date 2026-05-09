@@ -271,6 +271,8 @@ separate axis from how many subscribers each topic has.
 
 ---
 
+<p align="center"><img src="images/ios-warning-above.svg" alt="STOP — iOS users must read this section"></p>
+
 #### iOS — important: make notifications persistent
 
 **On iOS, notifications disappear by default after a few seconds. You will
@@ -305,6 +307,8 @@ Recommended additional settings:
 
 **If you don't change Banner Style to Persistent, you will routinely miss
 login alerts on iOS.** Consider this step mandatory.
+
+<p align="center"><img src="images/ios-warning-below.svg" alt="If you skip the iOS setup above, you will miss login alerts"></p>
 
 #### Android — usually works out of the box
 
