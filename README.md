@@ -17,6 +17,9 @@ does not block the other.
 
 - [What it detects](#what-it-detects)
 - [How it works](#how-it-works)
+- [Receiving notifications (ntfy)](#receiving-notifications-ntfy)
+  - [iOS — important: make notifications persistent](#ios--important-make-notifications-persistent)
+  - [Android — usually works out of the box](#android--usually-works-out-of-the-box)
 - [Install](#install)
 - [Configuration](#configuration)
   - [Command-line flags](#command-line-flags)
@@ -82,12 +85,173 @@ Events that are explicitly **not** notified:
   500 ms initial, 10 s cap). Auth failures and other 4xx-class errors are
   marked permanent and skip the retry wait.
 
+## Receiving notifications (ntfy)
+
+deskbell sends notifications via [**ntfy**](https://ntfy.sh) — a free,
+open-source, HTTP-based pub-sub notification service. ntfy lets you push a
+message to a server with a `curl`-shaped HTTP request and receive it on any
+subscribed device. Source code and self-hosting docs:
+**https://github.com/binwiederhier/ntfy** (Apache-2.0).
+
+You can use the public hosted server at `ntfy.sh` (deskbell's default) or
+run your own (point deskbell at it with `DESKBELL_NTFY_URL=…`).
+
+To receive deskbell's notifications, **subscribe to the topic** that
+deskbell is publishing to. The topic name *is* the secret on the public
+ntfy.sh server — anyone who knows it can read your alerts and post into
+your feed — so make it long and random (deskbell generates one for you when
+the install command sees `DESKBELL_NTFY_TOPIC` already set; otherwise pick
+your own ≥ 16 random characters from `[A-Za-z0-9_-]`).
+
+### Browser (no install)
+
+Open `https://ntfy.sh/<your-topic>` in any browser — messages stream live.
+Useful for quick verification.
+
+### Phone apps
+
+| Platform                | Where                                                                           |
+|-------------------------|---------------------------------------------------------------------------------|
+| iOS                     | App Store: search **"ntfy"** (publisher: Philipp Heckel), or follow the App Store link from https://ntfy.sh |
+| Android (Google Play)   | https://play.google.com/store/apps/details?id=io.heckel.ntfy                    |
+| Android (F-Droid)       | https://f-droid.org/packages/io.heckel.ntfy/                                    |
+
+After installing, open the app, tap the **+** button, leave the server as
+`ntfy.sh` (or set your self-hosted URL), and paste the topic.
+
+### CLI / desktop
+
+```sh
+# stream as JSON, one line per message
+curl -s https://ntfy.sh/<your-topic>/json
+
+# the official ntfy CLI
+ntfy subscribe <your-topic>
+```
+
+There are also browser extensions and desktop builds linked from the
+[ntfy GitHub repo](https://github.com/binwiederhier/ntfy).
+
+---
+
+### iOS — important: make notifications persistent
+
+**On iOS, notifications disappear by default after a few seconds. You will
+miss login alerts unless you change one specific setting.** This is an iOS
+behaviour, not an ntfy bug — every app's notifications behave this way out
+of the box, and you have to tell iOS per-app to keep them on screen.
+
+**Do this once, immediately after installing the ntfy app:**
+
+1. Open the iOS **Settings** app.
+2. Scroll to **Notifications**, then tap **ntfy** in the app list.
+3. Make sure **Allow Notifications** is **on**.
+4. Under **Alerts**, enable all three: **Lock Screen**, **Notification
+   Center**, **Banners**.
+5. Tap **Banner Style** and change it from *Temporary* to **Persistent**.
+   **This is the critical step.** *Temporary* banners auto-dismiss in
+   roughly five seconds; *Persistent* banners stay on screen until you
+   tap them.
+6. Set **Sounds** to **on**.
+7. Set **Badges** to **on**.
+8. Set **Show Previews** to **Always** so the title is visible without
+   unlocking the phone.
+
+Recommended additional settings:
+
+- **Notification Grouping → By App** so a burst of logins doesn't get
+  collapsed into a single group you might dismiss accidentally.
+- **Time Sensitive Notifications → on** (if shown). deskbell sends login
+  alerts with `high` priority; this lets them break through Focus modes.
+- **Critical Alerts** — only available with a paid Apple developer
+  configuration; ntfy does not currently use these.
+
+**If you don't change Banner Style to Persistent, you will routinely miss
+login alerts on iOS.** Consider this step mandatory.
+
+### Android — usually works out of the box
+
+For most users, Android needs **no special configuration**. Just install
+the ntfy app, subscribe to your topic, and you're done.
+
+The reason it just works: the **Play Store** build of ntfy uses Google's
+**Firebase Cloud Messaging (FCM)** to deliver pushes. FCM is the same
+channel WhatsApp / Gmail / Signal use, and it's exempt from Android's
+normal background-activity and battery-optimisation restrictions. The
+ntfy app itself doesn't have to be running for FCM-routed messages to
+reach you.
+
+Two cases where you *do* need to do extra work:
+
+**Case 1 — you installed ntfy from F-Droid.**
+F-Droid builds don't include Google services, so the app maintains its
+own background WebSocket connection to the ntfy server. That connection
+is killed by Android's battery optimisation. Fix:
+
+- **Settings → Apps → ntfy → Battery → Unrestricted** (default is
+  *Optimised*).
+
+**Case 2 — you self-host ntfy and haven't configured FCM credentials.**
+Same situation as F-Droid: no FCM, so the app holds its own connection
+and battery optimisation will eventually kill it. Either configure FCM on
+your self-hosted server (see the [ntfy docs](https://docs.ntfy.sh/config/#firebase-fcm))
+or exempt the ntfy app from battery optimisation as in Case 1.
+
+**Manufacturer-specific quirks.**
+Some Android skins (Xiaomi MIUI, Huawei EMUI, OnePlus/Oppo ColorOS,
+older Samsung builds) aggressively kill *all* background apps, sometimes
+including FCM-using ones. If notifications arrive late or not at all on
+one of those phones, the [ntfy Android docs](https://docs.ntfy.sh/subscribe/phone/)
+have per-manufacturer settings (Autostart, "no battery restrictions",
+etc.). This is a generic Android-skin issue, not something specific to
+ntfy or deskbell.
+
+### Self-hosting ntfy
+
+If you'd rather not depend on the public `ntfy.sh` server, ntfy is a
+single Go binary you can run on your own host. See
+**https://docs.ntfy.sh/install/** and the
+[ntfy GitHub repo](https://github.com/binwiederhier/ntfy) for installation,
+TLS configuration, and access control. Point deskbell at it with
+`DESKBELL_NTFY_URL=https://ntfy.your-domain.example.com`.
+
+---
+
 ## Install
 
-### Option 1: from a local binary
+### Option 1: prebuilt binary (recommended)
 
-Build, then run the self-installer (it copies itself to `/usr/local/bin` and
-writes a hardened systemd unit):
+Statically-linked binaries (no glibc dependency) for `linux/amd64` and
+`linux/arm64` are published on the
+[releases page](https://github.com/starqueue/deskbell/releases/latest).
+
+```sh
+# pick one
+ARCH=amd64    # or arm64
+
+curl -L -o deskbell \
+  https://github.com/starqueue/deskbell/releases/download/v0.2.0/deskbell-linux-${ARCH}
+chmod +x deskbell
+```
+
+Verify the download against the published checksums (recommended for any
+binary you fetch from the internet):
+
+```sh
+curl -L https://github.com/starqueue/deskbell/releases/download/v0.2.0/SHA256SUMS \
+  | grep "deskbell-linux-${ARCH}" \
+  | sha256sum -c -
+# deskbell-linux-amd64: OK
+```
+
+Then run the self-installer:
+
+```sh
+DESKBELL_NTFY_TOPIC=my-secret-topic-9d2f \
+sudo -E ./deskbell install
+```
+
+### Option 2: from source
 
 ```sh
 go build -ldflags="-X main.version=v0.2.0" -o deskbell .
@@ -114,7 +278,7 @@ The install command is idempotent: re-running it with `-force` rewrites the
 env file from the current environment and bounces the unit on the next
 restart.
 
-### Option 2: with the full multi-transport configuration
+### Option 3: with the full multi-transport configuration
 
 ```sh
 DESKBELL_NTFY_TOPIC=my-secret-topic-9d2f \
