@@ -27,6 +27,7 @@ does not block the other.
 - [Startup ping](#startup-ping)
 - [Operating](#operating)
 - [Uninstall](#uninstall)
+- [Privileges](#privileges)
 - [Security model](#security-model)
 - [Build, test, lint](#build-test-lint)
 - [Project layout](#project-layout)
@@ -320,6 +321,109 @@ sudo deskbell uninstall -purge   # also remove env dir, system user, binary
 `uninstall` is idempotent — running it on a host where deskbell is already
 gone is a no-op. `-purge` is destructive; with it, the env file (containing
 your tokens / SMTP password) is deleted.
+
+## Privileges
+
+### Install-time (one-shot, root required)
+
+`sudo -E deskbell install` needs root because it:
+
+- writes to `/usr/local/bin/` (the binary)
+- writes to `/etc/systemd/system/` (the unit) and `/etc/deskbell/` (the env file)
+- runs `useradd --system` to create the `deskbell` service account
+- runs `usermod -aG systemd-journal,adm deskbell` to grant log-read access
+- runs `systemctl daemon-reload && systemctl enable --now deskbell`
+
+`deskbell uninstall` is the same story — root for `userdel`, `systemctl
+disable`, and removing files.
+
+### Runtime (the daemon itself)
+
+Runs as the unprivileged **`deskbell`** system user (no home directory,
+`nologin` shell). What it actually requires:
+
+#### Read access to at least one event source
+
+| Source                                    | Privilege needed                                      |
+|-------------------------------------------|-------------------------------------------------------|
+| `journalctl -f -o json`                   | membership in the `systemd-journal` group             |
+| `/var/log/auth.log` (Debian/Ubuntu) or `/var/log/secure` (RHEL/Fedora) | membership in the `adm` group                         |
+| `who(1)` / `/var/run/utmp`                | none — utmp is world-readable on every distro         |
+
+The install command adds the `deskbell` user to **both** `systemd-journal`
+and `adm` so all three sources are available. If a group doesn't exist on
+the host (e.g. minimal containers without `adm`), that source is silently
+skipped — the daemon still runs as long as one source produces events.
+
+#### Network egress
+
+- Outbound TCP 443 to your ntfy server(s) (or 80 if you self-host).
+- Outbound TCP to your SMTP server (587 / 465 / 25 / 2525, whatever you
+  configured).
+
+No inbound ports — deskbell never listens.
+
+#### Filesystem
+
+- Read `/etc/deskbell/deskbell.env` (mode 0640, owned `root:deskbell`).
+- Read `/var/log/auth.log`, `/var/log/secure`, etc. (via `adm` group).
+- Read `/var/run/utmp` (world-readable).
+- Read `/proc/self/*` (for journald subprocess management).
+
+Everything else is locked down by the unit:
+
+- `ProtectSystem=strict` — entire `/usr`, `/boot`, `/etc` is read-only.
+- `ProtectHome=yes` — `/home`, `/root`, `/run/user` invisible.
+- `PrivateTmp=yes` — fresh empty `/tmp`.
+- `PrivateDevices=yes` — only `/dev/null`, `/dev/zero`, `/dev/random`.
+- `ProtectKernelTunables/Modules/Logs/Clock=yes` — no `/sys` or
+  `/proc/kallsyms` writes, no `init_module`, no `kexec`, no clock changes.
+
+### What deskbell explicitly does **not** need
+
+- **No Linux capabilities.** The unit sets `CapabilityBoundingSet=` and
+  `AmbientCapabilities=` to empty.
+  - No `CAP_NET_BIND_SERVICE` (doesn't bind a port).
+  - No `CAP_DAC_READ_SEARCH` (uses group membership for log access, not
+    bypass).
+  - No `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYSLOG`,
+    etc.
+- **No setuid / setgid bits** on the binary.
+- **No root at runtime.** A bug in deskbell can't escalate.
+- **No `AF_PACKET` / `AF_NETLINK` / `AF_BLUETOOTH`.**
+  `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX` only.
+- **No `mmap(PROT_WRITE|PROT_EXEC)`.** `MemoryDenyWriteExecute=yes`.
+- **No mount syscalls, no privileged syscalls, no resource-control
+  syscalls.** `SystemCallFilter=@system-service` minus
+  `@privileged @resources @mount`.
+
+### Minimum-privilege footprint
+
+If you want to run with the absolute least access, drop the `deskbell` user
+from both `systemd-journal` and `adm` and rely solely on `who(1)` polling:
+
+```sh
+sudo gpasswd -d deskbell systemd-journal
+sudo gpasswd -d deskbell adm
+sudo systemctl restart deskbell
+```
+
+Trade-off: console and GDM/LightDM events show up only when `who(1)` next
+snapshots them (within `-poll` seconds, default 5 s), and SSH events show
+up the same way rather than instantly from the journal — but you're now
+running with literally just network egress and utmp read access.
+
+### Quick verification
+
+```sh
+# Confirm the running process is unprivileged + group-restricted:
+ps -o user,group,cmd -C deskbell
+id deskbell
+
+# Confirm the sandbox is active:
+systemd-analyze security deskbell
+# (Should report a low-ish exposure level — the unit hardening is fairly strict.)
+```
 
 ## Security model
 
