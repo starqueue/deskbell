@@ -275,18 +275,18 @@ separate axis from how many subscribers each topic has.
 
 #### iOS (ntfy app) — important: make notifications persistent
 
-<font color="red">
+```diff
+- This section applies to the ntfy iOS app only — not to email,
+- which lands in your normal inbox app and needs no special setup.
+-
+- On iOS, notifications from the ntfy app disappear by default after a
+- few seconds. You will miss login alerts unless you change one specific
+- setting. This is an iOS behaviour, not an ntfy bug — every app's
+- notifications behave this way out of the box, and you have to tell iOS
+- per-app to keep them on screen.
+```
 
-**This section applies to the [ntfy](https://ntfy.sh) iOS app only — not to
-email**, which lands in your normal inbox app and needs no special setup.
-
-**On iOS, notifications from the ntfy app disappear by default after a few
-seconds. You will miss login alerts unless you change one specific
-setting.** This is an iOS behaviour, not an ntfy bug — every app's
-notifications behave this way out of the box, and you have to tell iOS
-per-app to keep them on screen.
-
-**Do this once, immediately after installing the ntfy app:**
+**Do this once, immediately after installing the [ntfy](https://ntfy.sh) iOS app:**
 
 1. Open the iOS **Settings** app.
 2. Scroll to **Notifications**, then tap **ntfy** in the app list.
@@ -311,10 +311,10 @@ Recommended additional settings:
 - **Critical Alerts** — only available with a paid Apple developer
   configuration; ntfy does not currently use these.
 
-**If you don't change Banner Style to Persistent, you will routinely miss
-login alerts on iOS.** Consider this step mandatory.
-
-</font>
+```diff
+- If you don't change Banner Style to Persistent, you will routinely
+- miss login alerts on iOS. Consider this step mandatory.
+```
 
 <p align="center"><img src="images/ios-warning-below.svg" alt="iOS ntfy users: you'll miss notifications if you skip the above steps"></p>
 
