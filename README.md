@@ -1,15 +1,17 @@
-# deskbell
+<p align="center">
+  <img src="images/deskbell-logo-small.jpeg" alt="deskbell logo: hand ringing a service desk bell">
+</p>
 
-A small Linux daemon that watches login events on the host it runs on and
-posts a notification whenever someone successfully logs in. It is built for
-homelabs and small-fleet operators who want a "doorbell for shells" — fast
-to install, no broker, no agent infrastructure, just a single Go binary and
-a hardened systemd unit.
+# deskbell — notifies you when anyone logs in to Linux
 
-deskbell can fan notifications out to any number of [ntfy](https://ntfy.sh)
-destinations (public ntfy.sh, self-hosted, or a mix), and optionally also
-mirror them to email via SMTP. Both transports run in parallel; one failing
-does not block the other.
+deskbell runs on a linux machine and sends you a notification when someone
+signs in.
+
+It detects SSH, console, display-manager (GDM, LightDM, SDDM, XDM, KDM,
+greetd), and Cockpit logins, and fans every notification out to any number
+of [ntfy](https://ntfy.sh) destinations (public ntfy.sh, self-hosted, or a
+mix) and/or email — in parallel, with retries. Single Go binary,
+self-installing hardened systemd service, no broker, no agent.
 
 ---
 
