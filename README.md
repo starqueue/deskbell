@@ -4,14 +4,14 @@
 
 # deskbell — notifies you when anyone logs in to Linux
 
-deskbell runs on a linux machine and sends you a notification when someone
-signs in.
+You have Linux machines. You want to know when someone logs in.
 
-It detects SSH, console, display-manager (GDM, LightDM, SDDM, XDM, KDM,
-greetd), and Cockpit logins, and fans every notification out to any number
-of [ntfy](https://ntfy.sh) destinations (public ntfy.sh, self-hosted, or a
-mix) and/or email — in parallel, with retries. Single Go binary,
-self-installing hardened systemd service, no broker, no agent.
+deskbell runs on a Linux machine and sends you a notification when someone
+signs in. It detects SSH, console, display-manager (GDM, LightDM, SDDM,
+XDM, KDM, greetd), and Cockpit logins, and fans every notification out to
+any number of [ntfy](https://ntfy.sh) destinations (public ntfy.sh,
+self-hosted, or a mix) and/or email — in parallel, with retries. Single Go
+binary, self-installing hardened systemd service, no broker, no agent.
 
 ---
 
@@ -25,6 +25,13 @@ self-installing hardened systemd service, no broker, no agent.
     - [iOS — important: make notifications persistent](#ios--important-make-notifications-persistent)
     - [Android — usually works out of the box](#android--usually-works-out-of-the-box)
 - [Install](#install)
+  - [Get the binary](#get-the-binary)
+  - [systemd (self-install)](#systemd-self-install)
+  - [OpenRC](#openrc)
+  - [runit](#runit)
+  - [s6 / s6-rc](#s6--s6-rc)
+  - [supervisord](#supervisord)
+  - [Run it directly (no supervisor)](#run-it-directly-no-supervisor)
 - [Configuration](#configuration)
   - [Command-line flags](#command-line-flags)
   - [Environment variables](#environment-variables)
@@ -38,7 +45,6 @@ self-installing hardened systemd service, no broker, no agent.
 - [Security model](#security-model)
 - [Build, test, lint](#build-test-lint)
 - [Project layout](#project-layout)
-- [Init systems other than systemd](#init-systems-other-than-systemd)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -348,66 +354,66 @@ TLS configuration, and access control. Point deskbell at it with
 
 ## Install
 
-### Option 1: prebuilt binary (recommended)
+deskbell ships as a single static Linux binary. Installing has two
+parts: **(1) put the binary on the host**, and **(2) wire it into
+your init / process supervisor**. Skip to your supervisor:
+
+| Init / supervisor | Typical distros | Section |
+|---|---|---|
+| **systemd** | Debian, Ubuntu, RHEL, Fedora, CentOS, Rocky, Alma, openSUSE, Arch, most cloud images | [systemd (self-install)](#systemd-self-install) |
+| **OpenRC** | Alpine, Gentoo, Artix-OpenRC | [OpenRC](#openrc) |
+| **runit** | Void Linux, Artix-runit, Devuan-runit | [runit](#runit) |
+| **s6 / s6-rc** | Adélie, Artix-s6, Obarun | [s6 / s6-rc](#s6--s6-rc) |
+| **supervisord** | Distro-agnostic Python supervisor | [supervisord](#supervisord) |
+| **none** | Testing, containers, foreground in tmux/screen | [Run it directly](#run-it-directly-no-supervisor) |
+
+### Get the binary
+
+#### Option A: prebuilt release (recommended)
 
 Statically-linked binaries (no glibc dependency) for `linux/amd64` and
 `linux/arm64` are published on the
 [releases page](https://github.com/starqueue/deskbell/releases/latest).
 
 ```sh
-# pick one
 ARCH=amd64    # or arm64
 
 curl -L -o deskbell \
   https://github.com/starqueue/deskbell/releases/download/v0.2.0/deskbell-linux-${ARCH}
 chmod +x deskbell
-```
 
-Verify the download against the published checksums (recommended for any
-binary you fetch from the internet):
-
-```sh
+# verify against published checksums
 curl -L https://github.com/starqueue/deskbell/releases/download/v0.2.0/SHA256SUMS \
   | grep "deskbell-linux-${ARCH}" \
   | sha256sum -c -
 # deskbell-linux-amd64: OK
 ```
 
-Then run the self-installer:
+#### Option B: from source
 
 ```sh
-DESKBELL_NTFY_TOPIC=my-secret-topic-9d2f \
-sudo -E ./deskbell install
-```
-
-### Option 2: from source
-
-```sh
+git clone https://github.com/starqueue/deskbell.git
+cd deskbell
 go build -ldflags="-X main.version=v0.2.0" -o deskbell .
+```
 
+Once you have the `deskbell` binary, follow the section for your init
+system below.
+
+### systemd (self-install)
+
+`deskbell install` does it all: it writes a hardened unit, creates an
+unprivileged `deskbell` system user, populates `/etc/deskbell/deskbell.env`
+from any `DESKBELL_*` variables in the calling process, then enables and
+starts the service. Requires root.
+
+```sh
 DESKBELL_NTFY_TOPIC=my-secret-topic-9d2f \
 sudo -E ./deskbell install
 ```
 
-The install command:
-
-1. Refuses on non-systemd hosts.
-2. Copies the binary atomically to `/usr/local/bin/deskbell` (skipped when
-   already in place).
-3. Creates a `deskbell` system user with no home directory and a nologin
-   shell, then adds it to `systemd-journal` and `adm` so it can read journald
-   and `/var/log/auth.log`.
-4. Writes the env file `/etc/deskbell/deskbell.env` (mode 0640, root:deskbell)
-   from `DESKBELL_*` variables in the calling process.
-5. Writes `/etc/systemd/system/deskbell.service` — see
-   [Security model](#security-model) for the sandboxing flags.
-6. Runs `systemctl daemon-reload` then `systemctl enable --now deskbell`.
-
-The install command is idempotent: re-running it with `-force` rewrites the
-env file from the current environment and bounces the unit on the next
-restart.
-
-### Option 3: with the full multi-transport configuration
+For a full multi-transport setup, set every variable you want before
+running install:
 
 ```sh
 DESKBELL_NTFY_TOPIC=my-secret-topic-9d2f \
@@ -420,8 +426,295 @@ DESKBELL_SMTP_TO='ops@example.com,oncall@example.com' \
 sudo -E ./deskbell install
 ```
 
-`sudo -E` is required so `sudo` propagates the `DESKBELL_*` variables; the
-install command then writes only those into the env file.
+`sudo -E` is mandatory — it tells `sudo` to propagate the `DESKBELL_*`
+variables, which the install command then writes into the env file.
+
+What the install command does, in order:
+
+1. Refuses on non-systemd hosts (checks `/run/systemd/system`).
+2. Copies the binary atomically to `/usr/local/bin/deskbell` (skipped if
+   it's already in place).
+3. Creates a `deskbell` system user with no home directory and a
+   `nologin` shell, then adds it to `systemd-journal` and `adm` so it
+   can read journald and `/var/log/auth.log`.
+4. Writes `/etc/deskbell/deskbell.env` (mode 0640, owner `root:deskbell`)
+   from the propagated environment.
+5. Writes `/etc/systemd/system/deskbell.service` — see
+   [Security model](#security-model) for the sandboxing flags.
+6. `systemctl daemon-reload && systemctl enable --now deskbell`.
+
+Idempotent — re-run with `-force` to rewrite the env file from a new
+environment. Tail logs with `journalctl -u deskbell -f`.
+
+To uninstall:
+
+```sh
+sudo deskbell uninstall          # stop + disable + remove unit
+sudo deskbell uninstall -purge   # also remove env file, system user, binary
+```
+
+### OpenRC
+
+OpenRC is the default on Alpine, Gentoo, and Artix-OpenRC. deskbell
+does not self-install on OpenRC; do these steps once:
+
+**1. Place the binary:**
+
+```sh
+sudo install -m 0755 deskbell /usr/local/bin/deskbell
+```
+
+**2. Create the service user** (Alpine syntax shown — Gentoo:
+`useradd --system -M -s /sbin/nologin deskbell`):
+
+```sh
+sudo addgroup -S deskbell
+sudo adduser  -S -D -H -G deskbell -s /sbin/nologin deskbell
+sudo addgroup deskbell adm    # for /var/log/auth.log
+```
+
+**3. Write `/etc/conf.d/deskbell`** — sourced at start, this is OpenRC's
+equivalent of systemd's `EnvironmentFile`:
+
+```sh
+# /etc/conf.d/deskbell
+export DESKBELL_NTFY_TOPIC="my-secret-topic-9d2f"
+export DESKBELL_NTFY_URL="https://ntfy.sh"
+# uncomment whichever you need:
+# export DESKBELL_NTFY_TOKEN="tk_xxx"
+# export DESKBELL_SMTP_HOST="smtp.example.com"
+# export DESKBELL_SMTP_TO="ops@example.com"
+```
+
+```sh
+sudo chmod 0640 /etc/conf.d/deskbell
+sudo chown root:deskbell /etc/conf.d/deskbell
+```
+
+**4. Write `/etc/init.d/deskbell`:**
+
+```sh
+#!/sbin/openrc-run
+# /etc/init.d/deskbell
+
+name="deskbell"
+description="login event notifier"
+command="/usr/local/bin/deskbell"
+command_user="deskbell:deskbell"
+supervisor="supervise-daemon"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/deskbell.log"
+error_log="/var/log/deskbell.log"
+
+depend() {
+    need net
+    after firewall
+}
+```
+
+```sh
+sudo chmod +x /etc/init.d/deskbell
+```
+
+**5. Enable and start:**
+
+```sh
+sudo rc-update add deskbell default
+sudo rc-service deskbell start
+sudo rc-service deskbell status
+tail -f /var/log/deskbell.log
+```
+
+To uninstall: `sudo rc-service deskbell stop && sudo rc-update del deskbell default && sudo rm /etc/init.d/deskbell /etc/conf.d/deskbell`.
+
+### runit
+
+runit is the default on Void Linux and an option on Artix and Devuan.
+
+**1. Place the binary** at `/usr/local/bin/deskbell` and **create the
+service user** as in the OpenRC steps above (the `useradd --system`
+flavour, or your distro's `useradd`/`adduser` variant).
+
+**2. Set up the env directory.** runit's `chpst -e <dir>` reads each
+filename in the directory as an environment variable name and the file
+contents as the value (no shell sourcing; safe for passwords):
+
+```sh
+sudo mkdir -p /etc/deskbell/env
+echo -n 'my-secret-topic-9d2f' | sudo tee /etc/deskbell/env/DESKBELL_NTFY_TOPIC > /dev/null
+echo -n 'https://ntfy.sh'       | sudo tee /etc/deskbell/env/DESKBELL_NTFY_URL  > /dev/null
+sudo chmod 600 /etc/deskbell/env/*
+sudo chown -R root:deskbell /etc/deskbell
+sudo chmod 750 /etc/deskbell /etc/deskbell/env
+```
+
+**3. Create the service tree:**
+
+```sh
+sudo mkdir -p /etc/sv/deskbell/log
+sudo mkdir -p /var/log/deskbell
+```
+
+`/etc/sv/deskbell/run`:
+
+```sh
+#!/bin/sh
+exec 2>&1
+exec chpst -u deskbell:deskbell -e /etc/deskbell/env /usr/local/bin/deskbell
+```
+
+`/etc/sv/deskbell/log/run` (svlogd captures stdout):
+
+```sh
+#!/bin/sh
+exec svlogd -tt /var/log/deskbell
+```
+
+```sh
+sudo chmod +x /etc/sv/deskbell/run /etc/sv/deskbell/log/run
+```
+
+**4. Enable** by symlinking into the supervised directory (Void:
+`/var/service`, Devuan: `/etc/service`):
+
+```sh
+sudo ln -s /etc/sv/deskbell /var/service/
+sudo sv status deskbell
+tail -f /var/log/deskbell/current
+```
+
+To stop / disable: `sudo rm /var/service/deskbell` (the symlink only —
+runit takes care of stopping the process).
+
+### s6 / s6-rc
+
+s6 is a process-supervision toolkit; how exactly you wire a service
+into it depends on which framework sits on top (`s6-rc`, `66`,
+`s6-linux-init`, …). The recipe below is a minimal `s6-rc`
+source definition; adapt to your distro's layout.
+
+**1. Place the binary, create the service user, and create
+`/etc/deskbell/env/<VAR>` files** as in the [runit](#runit) recipe.
+
+**2. Source-tree directory:**
+
+```sh
+sudo mkdir -p /etc/s6-rc/source/deskbell
+echo "longrun" | sudo tee /etc/s6-rc/source/deskbell/type > /dev/null
+```
+
+**3. Write `/etc/s6-rc/source/deskbell/run`** (execlineb syntax):
+
+```
+#!/command/execlineb -P
+fdmove -c 2 1
+s6-envdir /etc/deskbell/env
+s6-setuidgid deskbell
+/usr/local/bin/deskbell
+```
+
+```sh
+sudo chmod +x /etc/s6-rc/source/deskbell/run
+```
+
+**4. Compile and activate:**
+
+```sh
+sudo s6-rc-compile /etc/s6-rc/compiled-new /etc/s6-rc/source
+sudo s6-rc-update  /etc/s6-rc/compiled-new
+sudo s6-rc -u change deskbell
+```
+
+For longer-form supervision, logging, and user-facing tooling, see the
+[s6 docs](https://skarnet.org/software/s6/) and the
+[s6-rc guide](https://skarnet.org/software/s6-rc/) — exact paths and
+helper commands vary between distros (Adélie, Artix, Obarun all wire it
+up slightly differently).
+
+### supervisord
+
+supervisord is a Python process supervisor that runs *under* whatever
+init your distro uses. It's the easiest non-systemd option: a single
+config file, no system-user gymnastics required if you're OK running
+deskbell as root (not recommended) or as your existing login user.
+
+**1. Install supervisord** (skip if already installed):
+
+```sh
+# Debian/Ubuntu
+sudo apt-get install supervisor
+# RHEL/Fedora
+sudo dnf install supervisor
+# Alpine
+sudo apk add supervisor
+```
+
+**2. Place the binary** at `/usr/local/bin/deskbell`.
+
+**3. (Recommended) create a `deskbell` system user** as in the
+systemd / OpenRC / runit recipes, so the daemon doesn't run as root.
+
+**4. Write `/etc/supervisor/conf.d/deskbell.conf`** (Alpine puts it
+under `/etc/supervisor.d/deskbell.ini` — adjust for your distro):
+
+```ini
+[program:deskbell]
+command=/usr/local/bin/deskbell
+user=deskbell
+autostart=true
+autorestart=true
+startretries=3
+stopsignal=TERM
+stopwaitsecs=10
+stderr_logfile=/var/log/deskbell.err.log
+stdout_logfile=/var/log/deskbell.log
+environment=
+    DESKBELL_NTFY_TOPIC="my-secret-topic-9d2f",
+    DESKBELL_NTFY_URL="https://ntfy.sh"
+```
+
+```sh
+sudo chmod 0600 /etc/supervisor/conf.d/deskbell.conf   # values include secrets
+```
+
+**5. Reload and start:**
+
+```sh
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl status deskbell
+sudo tail -f /var/log/deskbell.log
+```
+
+To uninstall: delete the conf file, then `sudo supervisorctl reread &&
+sudo supervisorctl update`.
+
+Caveat: supervisord's `environment=` directive only takes simple
+`KEY=value` pairs — protect the conf file (mode 0600) since secrets
+are in it. There is no equivalent of systemd's `LoadCredential`.
+
+### Run it directly (no supervisor)
+
+For quick testing, container entrypoints, or hosts where you'd rather
+supervise deskbell yourself, just run it in the foreground. It writes
+structured logs to stderr.
+
+```sh
+DESKBELL_NTFY_TOPIC=my-secret-topic-9d2f \
+./deskbell
+```
+
+Add `-verbose` for debug-level logs; `-dry-run` to print notifications
+instead of sending them. Ctrl-C shuts down cleanly, flushing any
+queued digest. To keep it running across SSH disconnects, wrap in
+`tmux`, `screen`, `nohup`, or `setsid`. To run as a container:
+
+```dockerfile
+FROM gcr.io/distroless/static
+COPY deskbell /deskbell
+USER 65534:65534
+ENTRYPOINT ["/deskbell"]
+```
 
 ## Configuration
 
@@ -790,31 +1083,6 @@ in `main.go` are:
 5. Notifier (queue, rate limit, digest, fan-out dispatcher)
 6. Install / uninstall (systemd integration)
 7. Wiring (`main` / `realMain` / `run`)
-
-## Init systems other than systemd
-
-`deskbell install` is systemd-only. On hosts without systemd:
-
-- **OpenRC**: drop the binary at `/usr/local/bin/deskbell`, write a simple
-  `/etc/init.d/deskbell` that supervises it under `start-stop-daemon`, and
-  point `EnvironmentFile`-equivalent at `/etc/deskbell/deskbell.env`.
-- **runit**: create `/etc/sv/deskbell/run` invoking `chpst -e
-  /etc/deskbell/env exec /usr/local/bin/deskbell` and `ln -s ../sv/deskbell
-  /var/service/`.
-- **s6**: an `s6-rc` source-definition tree, or whatever your distro's
-  s6 framework expects (`66`, `s6-linux-init`, …).
-- **supervisord**: an `[program:deskbell]` block in
-  `/etc/supervisor/conf.d/deskbell.conf` with `environment=` set from
-  `/etc/deskbell/deskbell.env`.
-
-deskbell itself does not care which supervisor runs it. It only requires:
-
-- A way to read `/var/log/auth.log` *or* call `journalctl` *or* shell out to
-  `who(1)` (one of the three).
-- Network egress to the configured ntfy server(s) and / or SMTP server.
-- A stable working directory (it reads no relative paths).
-
-PRs adding install scripts for non-systemd init systems are welcome.
 
 ## Troubleshooting
 
