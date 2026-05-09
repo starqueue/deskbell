@@ -24,8 +24,8 @@ hardened systemd service.
 - [Receiving notifications](#receiving-notifications)
   - [Email](#email)
   - [ntfy](#ntfy)
-    - [iOS — important: make notifications persistent](#ios--important-make-notifications-persistent)
-    - [Android — usually works out of the box](#android--usually-works-out-of-the-box)
+    - [iOS (ntfy app) — important: make notifications persistent](#ios-ntfy-app--important-make-notifications-persistent)
+    - [Android (ntfy app) — usually works out of the box](#android-ntfy-app--usually-works-out-of-the-box)
 - [Install](#install)
   - [Get the deskbell binary](#get-the-deskbell-binary)
   - [systemd (self-install)](#systemd-self-install)
@@ -271,14 +271,18 @@ separate axis from how many subscribers each topic has.
 
 ---
 
-<p align="center"><img src="images/ios-warning-above.svg" alt="STOP — iOS users must read this section"></p>
+<p align="center"><img src="images/ios-warning-above.svg" alt="STOP — iOS users using ntfy must read this section"></p>
 
-#### iOS — important: make notifications persistent
+#### iOS (ntfy app) — important: make notifications persistent
 
-**On iOS, notifications disappear by default after a few seconds. You will
-miss login alerts unless you change one specific setting.** This is an iOS
-behaviour, not an ntfy bug — every app's notifications behave this way out
-of the box, and you have to tell iOS per-app to keep them on screen.
+**This section applies to the [ntfy](https://ntfy.sh) iOS app only — not to
+email**, which lands in your normal inbox app and needs no special setup.
+
+**On iOS, notifications from the ntfy app disappear by default after a few
+seconds. You will miss login alerts unless you change one specific
+setting.** This is an iOS behaviour, not an ntfy bug — every app's
+notifications behave this way out of the box, and you have to tell iOS
+per-app to keep them on screen.
 
 **Do this once, immediately after installing the ntfy app:**
 
@@ -308,9 +312,13 @@ Recommended additional settings:
 **If you don't change Banner Style to Persistent, you will routinely miss
 login alerts on iOS.** Consider this step mandatory.
 
-<p align="center"><img src="images/ios-warning-below.svg" alt="If you skip the iOS setup above, you will miss login alerts"></p>
+<p align="center"><img src="images/ios-warning-below.svg" alt="If you skip the ntfy iOS setup above, you will miss login alerts on iOS"></p>
 
-#### Android — usually works out of the box
+#### Android (ntfy app) — usually works out of the box
+
+This section applies to the [ntfy](https://ntfy.sh) Android app only — not
+to email.
+
 
 For most users, Android needs **no special configuration**. Just install
 the ntfy app, subscribe to your topic, and you're done.
