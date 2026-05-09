@@ -312,7 +312,7 @@ Recommended additional settings:
 **If you don't change Banner Style to Persistent, you will routinely miss
 login alerts on iOS.** Consider this step mandatory.
 
-<p align="center"><img src="images/ios-warning-below.svg" alt="If you skip the ntfy iOS setup above, you will miss login alerts on iOS"></p>
+<p align="center"><img src="images/ios-warning-below.svg" alt="ntfy iOS users: you'll miss notifications if you skip the above steps"></p>
 
 #### Android (ntfy app) — usually works out of the box
 
