@@ -18,6 +18,7 @@ does not block the other.
 - [What it detects](#what-it-detects)
 - [How it works](#how-it-works)
 - [Receiving notifications (ntfy)](#receiving-notifications-ntfy)
+  - [One topic, as many subscribers as you want](#one-topic-as-many-subscribers-as-you-want)
   - [iOS — important: make notifications persistent](#ios--important-make-notifications-persistent)
   - [Android — usually works out of the box](#android--usually-works-out-of-the-box)
 - [Install](#install)
@@ -103,10 +104,37 @@ your feed — so make it long and random (deskbell generates one for you when
 the install command sees `DESKBELL_NTFY_TOPIC` already set; otherwise pick
 your own ≥ 16 random characters from `[A-Za-z0-9_-]`).
 
-### Browser (no install)
+### One topic, as many subscribers as you want
+
+ntfy is a pub-sub service: **every subscriber to a topic receives every
+message published to it.** You can — and should — subscribe to your
+deskbell topic from as many places as suits you, simultaneously. They
+are independent, free, and don't conflict:
+
+- a phone (iOS or Android) for push notifications when you're away from
+  your desk
+- a browser tab on your laptop for live in-flight monitoring
+- a `curl … /json` pipe into a terminal for scripted monitoring or audit
+  logging
+- a webhook bridge into Slack / Discord / Matrix / IFTTT / a SIEM (ntfy
+  supports outbound webhooks server-side)
+- another ntfy server forwarding via the federation features
+
+The same login event will arrive at all of them within seconds.
+
+You can also have **multiple deskbell hosts publish to the same topic** —
+useful for whole-fleet "doorbell" channels. Or, if you'd rather keep
+each host's events separate, give each host its own topic and subscribe
+the phone app to several topics at once (the app shows them as separate
+inboxes).
+
+The rest of this section covers the most common subscriber types. Pick
+any combination — or all of them.
+
+### Browser (no install, fastest to try)
 
 Open `https://ntfy.sh/<your-topic>` in any browser — messages stream live.
-Useful for quick verification.
+Useful for quick verification right after `deskbell install`.
 
 ### Phone apps
 
@@ -117,20 +145,38 @@ Useful for quick verification.
 | Android (F-Droid)       | https://f-droid.org/packages/io.heckel.ntfy/                                    |
 
 After installing, open the app, tap the **+** button, leave the server as
-`ntfy.sh` (or set your self-hosted URL), and paste the topic.
+`ntfy.sh` (or set your self-hosted URL), and paste the topic. You can
+add multiple topics to one app and toggle each on/off independently.
 
-### CLI / desktop
+### CLI / desktop / scripts
 
 ```sh
-# stream as JSON, one line per message
+# stream as JSON, one line per message — pipe into anything
 curl -s https://ntfy.sh/<your-topic>/json
 
 # the official ntfy CLI
 ntfy subscribe <your-topic>
+
+# example: persist every alert into a local logfile
+curl -s https://ntfy.sh/<your-topic>/json >> ~/deskbell-alerts.log &
 ```
 
 There are also browser extensions and desktop builds linked from the
 [ntfy GitHub repo](https://github.com/binwiederhier/ntfy).
+
+### Bridges to other services
+
+ntfy supports outbound webhooks server-side, which means you can chain
+deskbell → ntfy → Slack / Discord / Matrix / Microsoft Teams / a SIEM /
+PagerDuty / anything that accepts an HTTP POST. See
+[ntfy's publishing & forwarding docs](https://docs.ntfy.sh/publish/).
+This works in addition to, not instead of, the phone / browser / CLI
+subscribers.
+
+deskbell *itself* can also publish to **multiple ntfy destinations and
+to email at the same time** (configured via `DESKBELL_NTFY_DESTINATIONS`
+and the SMTP env vars — see [Configuration](#configuration)). That's a
+separate axis from how many subscribers each topic has.
 
 ---
 
