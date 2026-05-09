@@ -275,6 +275,8 @@ separate axis from how many subscribers each topic has.
 
 #### iOS (ntfy app) — important: make notifications persistent
 
+<font color="red">
+
 **This section applies to the [ntfy](https://ntfy.sh) iOS app only — not to
 email**, which lands in your normal inbox app and needs no special setup.
 
@@ -311,6 +313,8 @@ Recommended additional settings:
 
 **If you don't change Banner Style to Persistent, you will routinely miss
 login alerts on iOS.** Consider this step mandatory.
+
+</font>
 
 <p align="center"><img src="images/ios-warning-below.svg" alt="iOS ntfy users: you'll miss notifications if you skip the above steps"></p>
 
