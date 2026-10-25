@@ -58,7 +58,7 @@ import (
 //
 // When unset, versionString() falls back to the module version (set by
 // `go install module@vX.Y.Z`) and finally to the embedded VCS revision.
-var version = "v0.2.0"
+var version = "v0.2.1"
 
 func versionString() string {
 	if version != "dev" {
